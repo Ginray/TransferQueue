@@ -40,8 +40,22 @@ class BaseSampler(ABC):
     NOTE: Always return both sampled and consumed indexes (may be identical).
     """
 
-    def __init__(self):
+    def __init__(self, locality_aware: bool = False):
         self._states: dict[Any, Any] = {}
+        self.locality_aware = locality_aware
+
+    @staticmethod
+    def _partition_by_locality(
+        indexes: list[int],
+        consumer_node_ip: str | None,
+        placement_map: dict[int, str] | None,
+    ) -> tuple[list[int], list[int]]:
+        """Split ``indexes`` into (local, remote) buckets by node IP."""
+        if not consumer_node_ip or not placement_map:
+            return list(indexes), []
+        local = [i for i in indexes if placement_map.get(i) == consumer_node_ip]
+        remote = [i for i in indexes if placement_map.get(i) != consumer_node_ip]
+        return local, remote
 
     @abstractmethod
     def sample(

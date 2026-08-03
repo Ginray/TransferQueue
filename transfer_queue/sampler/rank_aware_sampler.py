@@ -40,15 +40,9 @@ class RankAwareSampler(BaseSampler):
     https://github.com/Ascend/TransferQueue/issues/1
     """
 
-    def __init__(self):
-        """Initialize the RankAwareSampler.
-
-        The sampler maintains internal state to coordinate sampling across ranks
-        within the same data replica group. This state tracks which samples have been sampled
-        and how many times they have been fetched.
-        """
-
-        super().__init__()
+    def __init__(self, locality_aware: bool = False):
+        """Initialize the RankAwareSampler."""
+        super().__init__(locality_aware=locality_aware)
 
     def sample(
         self,
@@ -125,8 +119,15 @@ class RankAwareSampler(BaseSampler):
             self._states[partition_id][task_name][dp_rank] = {}
 
         if batch_index not in self._states[partition_id][task_name][dp_rank]:
-            # Select first batch_size indices from ready_indexes
-            sampled_indexes = ready_indexes[:batch_size]
+            # Locality-aware reorder: local-node indexes first.
+            if self.locality_aware:
+                consumer_node_ip = kwargs.get("consumer_node_ip")
+                placement_map = kwargs.get("placement_map")
+                local, remote = self._partition_by_locality(ready_indexes, consumer_node_ip, placement_map)
+                reordered = local + remote
+            else:
+                reordered = ready_indexes
+            sampled_indexes = reordered[:batch_size]
 
             if len(sampled_indexes) < batch_size:
                 return [], []

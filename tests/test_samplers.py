@@ -177,6 +177,27 @@ class TestSequentialSampler:
         assert sampled == [0, 1]
         assert consumed == [0, 1]
 
+    def test_sequential_sampler_prefers_local_indexes(self):
+        sampler = SequentialSampler(locality_aware=True)
+
+        sampled, consumed = sampler.sample(
+            [0, 1, 2, 3, 4],
+            batch_size=3,
+            consumer_node_ip="node-b",
+            placement_map={0: "node-a", 1: "node-b", 2: "node-a", 3: "node-b", 4: "node-a"},
+        )
+
+        assert sampled == [1, 3, 0]
+        assert consumed == sampled
+
+    def test_sequential_sampler_preserves_order_without_locality_context(self):
+        sampler = SequentialSampler(locality_aware=True)
+
+        sampled, consumed = sampler.sample([3, 1, 2], batch_size=2)
+
+        assert sampled == [3, 1]
+        assert consumed == sampled
+
 
 class TestGRPOGroupNSampler:
     """Test cases for GRPOGroupNSampler."""
@@ -662,6 +683,23 @@ class TestRankAwareSampler:
 
         assert sampled == [0, 1]
         assert consumed == [0, 1]
+
+    def test_rank_aware_sampler_prefers_local_indexes_on_first_assignment(self):
+        sampler = RankAwareSampler(locality_aware=True)
+
+        sampled, consumed = sampler.sample(
+            [0, 1, 2, 3],
+            batch_size=2,
+            dp_rank=0,
+            batch_index=0,
+            task_name="task",
+            partition_id="partition",
+            consumer_node_ip="node-b",
+            placement_map={0: "node-a", 1: "node-b", 2: "node-a", 3: "node-b"},
+        )
+
+        assert sampled == [1, 3]
+        assert consumed == sampled
 
     def test_rank_aware_sampler_call_method(self):
         """Test that __call__ method works correctly."""

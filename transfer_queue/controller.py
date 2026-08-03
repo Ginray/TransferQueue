@@ -995,6 +995,9 @@ class TransferQueueController:
 
         # Connected storage managers tracking
         self._connected_storage_managers: set[str] = set()
+        # SU -> node_ip mapping for locality-aware sampling
+        self._su_node_map: dict[str, str] = {}
+        self._ordered_su_ids: list[str] = []
 
         # Prometheus metrics exporter (lazy-initialized when enabled)
         self._metrics: TQMetricsExporter | None = None
@@ -1308,13 +1311,33 @@ class TransferQueueController:
                 else:
                     break
 
+            # Build placement_map for locality-aware samplers
+            effective_sampling_config = dict(sampling_config or {})
+            placement_map: dict[int, str] = {}
+            if getattr(self.sampler, "locality_aware", False) and self._ordered_su_ids:
+                num_units = len(self._ordered_su_ids)
+                for idx in ready_for_consume_indexes:
+                    su_id = self._ordered_su_ids[idx % num_units]
+                    node_ip = self._su_node_map.get(su_id)
+                    if node_ip is not None:
+                        placement_map[idx] = node_ip
+            if placement_map:
+                effective_sampling_config["placement_map"] = placement_map
+
             batch_global_indexes, consumed_indexes = self.sampler(
                 ready_for_consume_indexes,
                 batch_size,
                 partition=self._get_partition(partition_id),
-                **(sampling_config or {}),
+                **effective_sampling_config,
                 **kwargs,
             )
+
+            if self._metrics is not None and placement_map:
+                consumer_node_ip = effective_sampling_config.get("consumer_node_ip")
+                if consumer_node_ip:
+                    local_count = sum(placement_map.get(idx) == consumer_node_ip for idx in batch_global_indexes)
+                    remote_count = sum(placement_map.get(idx) != consumer_node_ip for idx in batch_global_indexes)
+                    self._metrics.record_locality_selection(local_count, remote_count)
 
             # Check if we got valid results from the sampler.
             # Some samplers (e.g. SeqlenBalancedSampler) may return variable-size
@@ -1737,7 +1760,7 @@ class TransferQueueController:
                     if request_msg.request_type == ZMQRequestType.HANDSHAKE:
                         storage_manager_id = request_msg.sender_id
 
-                        # Always send ACK for HANDSHAKE
+                        # Always send ACK for HANDSHAKE.
                         response_msg = ZMQMessage.create(
                             request_type=ZMQRequestType.HANDSHAKE_ACK,
                             sender_id=self.controller_id,
@@ -1845,6 +1868,23 @@ class TransferQueueController:
                             "success": success,
                         },
                     )
+
+            elif request_msg.request_type == ZMQRequestType.TOPOLOGY_REPORT:
+                su_node_map = request_msg.body.get("su_node_map")
+                ordered_su_ids = request_msg.body.get("ordered_su_ids")
+                if isinstance(su_node_map, dict) and isinstance(ordered_su_ids, list):
+                    self._su_node_map.update(su_node_map)
+                    self._ordered_su_ids = [su_id for su_id in ordered_su_ids if su_id in self._su_node_map]
+                    logger.debug(
+                        f"[{self.controller_id}]: updated su_node_map "
+                        f"({len(self._su_node_map)} SUs) from {request_msg.sender_id}"
+                    )
+                response_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.TOPOLOGY_REPORT_ACK,
+                    sender_id=self.controller_id,
+                    receiver_id=request_msg.sender_id,
+                    body={},
+                )
 
             elif request_msg.request_type == ZMQRequestType.GET_PARTITION_META:
                 with monitor.measure(op_type="GET_PARTITION_META"):

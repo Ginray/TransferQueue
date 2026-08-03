@@ -31,6 +31,7 @@ from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
+    get_node_ip_address,
     with_zmq_socket,
 )
 
@@ -153,6 +154,9 @@ class AsyncTransferQueueClient:
             >>> print(batch_meta.is_ready)  # May be False if some samples not ready
         """
         assert socket is not None
+        # Auto-inject consumer_node_ip for locality-aware samplers
+        effective_sampling_config = dict(sampling_config) if sampling_config else {}
+        effective_sampling_config.setdefault("consumer_node_ip", get_node_ip_address())
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.GET_META,  # type: ignore[arg-type]
             sender_id=self.client_id,
@@ -163,7 +167,7 @@ class AsyncTransferQueueClient:
                 "partition_id": partition_id,
                 "mode": mode,
                 "task_name": task_name,
-                "sampling_config": sampling_config,
+                "sampling_config": effective_sampling_config,
             },
         )
 

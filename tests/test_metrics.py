@@ -89,6 +89,8 @@ class TestMetricDefinitions:
             "tq_controller_request_duration_seconds",
             "tq_controller_request",
             "tq_controller_request_errors",
+            "tq_controller_locality_local_selected_samples",
+            "tq_controller_locality_remote_selected_samples",
             "tq_storage_capacity_total",
             "tq_storage_active_keys_total",
             "tq_storage_utilization_ratio",
@@ -200,6 +202,15 @@ class TestMeasureContextManager:
 
         assert exporter.request_total.labels(op_type="GET_META")._value.get() == 3.0
         assert exporter.request_total.labels(op_type="CLEAR_PARTITION")._value.get() == 2.0
+
+    def test_locality_selection_metrics(self):
+        exporter = TQMetricsExporter()
+
+        exporter.record_locality_selection(local_count=3, remote_count=2)
+        exporter.record_locality_selection(local_count=1, remote_count=0)
+
+        assert exporter.locality_local_selected_samples._value.get() == 4.0
+        assert exporter.locality_remote_selected_samples._value.get() == 2.0
 
 
 # ---------------------------------------------------------------------------

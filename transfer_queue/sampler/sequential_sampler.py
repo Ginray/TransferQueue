@@ -43,13 +43,10 @@ class SequentialSampler(BaseSampler):
 
     def __init__(
         self,
+        locality_aware: bool = False,
     ):
-        """Initialize the SequentialSampler.
-
-        SequentialSampler requires no initialization parameters and maintains
-        minimal internal state for optimal performance.
-        """
-        super().__init__()
+        """Initialize the SequentialSampler."""
+        super().__init__(locality_aware=locality_aware)
 
     def sample(
         self,
@@ -70,7 +67,14 @@ class SequentialSampler(BaseSampler):
         Returns:
             Tuple of (sampled_indexes, consumed_indexes), where consumed_indexes = sampled_indexes.
         """
-        sampled_indexes = ready_indexes[:batch_size]
+        if self.locality_aware:
+            consumer_node_ip = kwargs.get("consumer_node_ip")
+            placement_map = kwargs.get("placement_map")
+            local, remote = self._partition_by_locality(ready_indexes, consumer_node_ip, placement_map)
+            reordered = local + remote
+        else:
+            reordered = ready_indexes
+        sampled_indexes = reordered[:batch_size]
         consumed_indexes = sampled_indexes
 
         return sampled_indexes, consumed_indexes

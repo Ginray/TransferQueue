@@ -88,6 +88,26 @@ async def test_async_storage_manager_initialization(mock_async_storage_manager):
     assert "storage_1" in manager.storage_unit_infos
 
 
+def test_hash_routing_uses_registered_storage_unit_order():
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "test_hash_routing"
+    manager.controller_handshake_socket = None
+    manager.zmq_context = Mock()
+    manager.storage_unit_infos = {
+        "storage_1": ZMQServerInfo(
+            role=Role.STORAGE, id="storage_1", ip="10.0.0.2", ports={"put_get_socket": 12346}
+        ),
+        "storage_0": ZMQServerInfo(
+            role=Role.STORAGE, id="storage_0", ip="10.0.0.1", ports={"put_get_socket": 12345}
+        ),
+    }
+
+    routing = manager._group_by_hash([0, 1, 2, 3])
+
+    assert routing["storage_1"].global_indexes == [0, 2]
+    assert routing["storage_0"].global_indexes == [1, 3]
+
+
 @pytest.mark.asyncio
 async def test_async_storage_manager_mock_operations(mock_async_storage_manager):
     """Test AsyncSimpleStorageManager operations with mocked ZMQ."""

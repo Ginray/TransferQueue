@@ -15,6 +15,11 @@ controller:
   # ZMQ Server IP & Ports (automatically generated during init)
   zmq_info: null
 
+# Soft GET scheduling. When enabled, the built-in SequentialSampler and
+# RankAwareSampler prefer samples stored on the requesting node.
+scheduling:
+  locality_aware: false
+
 
 backend:
   # Pluggable storage/transport backend of TransferQueue. Choose from:

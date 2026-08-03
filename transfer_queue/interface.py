@@ -160,6 +160,8 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     if conf:
         final_conf = OmegaConf.merge(final_conf, conf)
 
+    locality_aware = bool(final_conf.scheduling.get("locality_aware", False))
+
     # TODO(hz): support load custom sampler class from external module.
     try:
         sampler = final_conf.controller.sampler
@@ -172,9 +174,19 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         elif isinstance(sampler, str):
             # user pass a sampler name str
             # try to convert as sampler class
-            sampler = globals()[final_conf.controller.sampler]
+            sampler = globals()[final_conf.controller.sampler]()
     except KeyError:
         raise ValueError(f"Could not find sampler {final_conf.controller.sampler}") from None
+
+    if locality_aware:
+        if isinstance(sampler, (SequentialSampler, RankAwareSampler)):
+            sampler.locality_aware = True
+        else:
+            logger.warning(
+                "scheduling.locality_aware is enabled, but sampler %s does not support Phase 1 locality; "
+                "using its existing behavior.",
+                type(sampler).__name__,
+            )
 
     try:
         global _TQ_CONTROLLER

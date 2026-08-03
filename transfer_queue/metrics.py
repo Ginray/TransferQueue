@@ -160,6 +160,20 @@ class TQMetricsExporter:
             "tq_global_index_reusable_total", "Number of reusable global indexes", registry=r
         )
 
+        # These count samples selected by GET_META, not storage GET RPCs.
+        # Keeping local and remote separate makes the hit rate directly
+        # observable without inferring it from aggregate NIC traffic.
+        self.locality_local_selected_samples = Counter(
+            "tq_controller_locality_local_selected_samples",
+            "Samples selected from storage local to the GET_META consumer",
+            registry=r,
+        )
+        self.locality_remote_selected_samples = Counter(
+            "tq_controller_locality_remote_selected_samples",
+            "Samples selected from storage remote to the GET_META consumer",
+            registry=r,
+        )
+
         # ---- Storage unit metrics ----
         self.storage_capacity = Gauge(
             "tq_storage_capacity_total", "Storage unit capacity (max keys)", ["storage_unit_id"], registry=r
@@ -244,6 +258,16 @@ class TQMetricsExporter:
             self.request_samples_total.labels(op_type=op_type).inc(count)
         except Exception:
             logger.debug(f"Metrics: failed to record samples for {op_type}", exc_info=True)
+
+    def record_locality_selection(self, local_count: int, remote_count: int) -> None:
+        """Record local and remote samples selected for a locality-aware GET_META."""
+        try:
+            if local_count:
+                self.locality_local_selected_samples.inc(local_count)
+            if remote_count:
+                self.locality_remote_selected_samples.inc(remote_count)
+        except Exception:
+            logger.debug("Metrics: failed to record locality selection", exc_info=True)
 
     def register_storage_units(self, storage_unit_infos: dict[str, ZMQServerInfo]) -> None:
         """Register SimpleStorageUnit ZMQ endpoints for metrics collection."""

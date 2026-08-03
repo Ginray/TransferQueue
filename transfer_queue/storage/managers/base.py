@@ -90,7 +90,7 @@ class StorageManager(ABC):
             raise ValueError(f"controller_info should be ZMQServerInfo, but got {type(self.controller_info)}")
 
         try:
-            # Create a synchronous context for handshake (blocking operation)
+            # Create a synchronous context for handshake (blocking operation).
             sync_zmq_context = zmq.Context()
 
             # create zmq socket for handshake (sync, for initial connection)
@@ -200,6 +200,59 @@ class StorageManager(ABC):
             f"[{self.storage_manager_id}]: Send handshake request from storage manager id "
             f"{self.storage_manager_id} to controller id #{self.controller_info.id} successfully."
         )
+
+    def _get_topology_info(self) -> dict[str, Any]:
+        """Return SU topology info to report to the controller. Override in subclasses."""
+        return {}
+
+    def _send_topology_report(self) -> None:
+        """Report SU topology to the controller. Best-effort, non-fatal.
+
+        This is called by a concrete storage manager after it has completed its
+        own initialization, so the reported topology is complete.
+        """
+        if not self.controller_info:
+            return
+        topo_info = self._get_topology_info()
+        if not topo_info:
+            return
+        sync_ctx = zmq.Context()
+        try:
+            addr = self.controller_info.to_addr("request_handle_socket")
+        except KeyError:
+            logger.debug(
+                f"[{self.storage_manager_id}]: controller has no request_handle_socket, skip topology report"
+            )
+            sync_ctx.term()
+            return
+        identity = f"{self.storage_manager_id}-topology-{uuid4().hex[:8]}".encode()
+        sock: zmq.Socket | None = None
+        try:
+            sock = create_zmq_socket(sync_ctx, zmq.DEALER, self.controller_info.ip, identity)
+            sock.connect(addr)
+            request_msg = ZMQMessage.create(
+                request_type=ZMQRequestType.TOPOLOGY_REPORT,
+                sender_id=self.storage_manager_id,
+                body=topo_info,
+            ).serialize()
+            sock.send_multipart(request_msg)
+            sock.setsockopt(zmq.RCVTIMEO, TQ_STORAGE_POLLER_TIMEOUT * 1000)
+            try:
+                messages = sock.recv_multipart()
+                ack_msg = ZMQMessage.deserialize(messages)
+                if ack_msg.request_type == ZMQRequestType.TOPOLOGY_REPORT_ACK:
+                    logger.debug(f"[{self.storage_manager_id}]: Got topology report ACK.")
+            except zmq.Again:
+                logger.debug(f"[{self.storage_manager_id}]: topology report ACK timed out (non-fatal)")
+        except Exception as e:
+            logger.warning(f"[{self.storage_manager_id}]: Failed to send topology report: {e}")
+        finally:
+            try:
+                if sock is not None and not sock.closed:
+                    sock.close(linger=0)
+            except Exception:
+                pass
+            sync_ctx.term()
 
     async def notify_data_update(
         self,

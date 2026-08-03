@@ -296,6 +296,7 @@ class DemoConfig:
     stage_sleep_seconds: float
     weight_sync_seconds: float
     num_data_storage_units: int
+    locality_aware: bool
     seed: int
     enable_worker_logs: bool
 
@@ -324,6 +325,7 @@ def build_tq_config(config: DemoConfig):
     override = OmegaConf.create(
         {
             "controller": {"sampler": RankAwareSampler, "polling_mode": True},
+            "scheduling": {"locality_aware": config.locality_aware},
             "backend": {
                 "storage_backend": "SimpleStorage",
                 "SimpleStorage": {"num_data_storage_units": config.num_data_storage_units},
@@ -416,7 +418,8 @@ class DataCentricPipelineDemo:
         logger.info(
             f"pipeline | num_steps={self.config.num_steps}, "
             f"global_batch_size={self.config.global_batch_size}, "
-            f"micro_batch_size={self.config.micro_batch_size}"
+            f"micro_batch_size={self.config.micro_batch_size}, "
+            f"locality_aware={self.config.locality_aware}"
         )
 
         refs = []
@@ -464,6 +467,7 @@ def main() -> None:
     parser.add_argument("--stage-sleep-seconds", type=float, default=0.15)
     parser.add_argument("--weight-sync-seconds", type=float, default=0.20)
     parser.add_argument("--num-data-storage-units", type=int, default=2)
+    parser.add_argument("--locality-aware", action="store_true")
     parser.add_argument("--seed", type=int, default=20260410)
     parser.add_argument("--enable-worker-logs", action="store_true")
     args = parser.parse_args()
@@ -486,6 +490,7 @@ def main() -> None:
         stage_sleep_seconds=args.stage_sleep_seconds,
         weight_sync_seconds=args.weight_sync_seconds,
         num_data_storage_units=args.num_data_storage_units,
+        locality_aware=args.locality_aware,
         seed=args.seed,
         enable_worker_logs=args.enable_worker_logs,
     )

@@ -126,6 +126,12 @@ Steps:
 | `tq_controller_request_duration_seconds` | Histogram | `op_type` | Request latency (buckets: 1ms–5s) |
 | `tq_controller_request_errors_total` | Counter | `op_type` | Total request errors |
 | `tq_controller_request_samples_total` | Counter | `op_type` | Total samples processed per operation (for batch-aware accounting) |
+| `tq_controller_locality_local_selected_samples_total` | Counter | — | Samples selected from a local SU during locality-aware `GET_META` |
+| `tq_controller_locality_remote_selected_samples_total` | Counter | — | Samples selected from a remote SU during locality-aware `GET_META` |
+
+The locality hit rate is `local / (local + remote)`. These counters describe
+Controller selection, rather than storage RPC completion, and are emitted only
+when locality is enabled and complete topology information is available.
 
 ### Storage Unit Metrics (collected via ZMQ, exposed on controller)
 

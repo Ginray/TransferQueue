@@ -89,6 +89,14 @@ class AsyncSimpleStorageManager(StorageManager):
 
         self.storage_unit_infos = self._register_servers(server_infos)
 
+        # The registered SU order defines the deterministic sample-hash order used by
+        # PUT, GET and CLEAR. The controller receives the same SU -> node map
+        # over its control plane and derives sample locality from this order.
+        self._su_to_node: dict[str, str] = {
+            su_id: info.ip for su_id, info in self.storage_unit_infos.items()
+        }
+        self._send_topology_report()
+
     def _register_servers(self, server_infos: "ZMQServerInfo | dict[Any, ZMQServerInfo]"):
         """Register and validate server information.
 
@@ -125,7 +133,7 @@ class AsyncSimpleStorageManager(StorageManager):
 
         NOTE: Dynamic SU scaling requires a data migration mechanism (not yet supported).
         """
-        storage_unit_keys = list(self.storage_unit_infos.keys())
+        storage_unit_keys = list(self.storage_unit_infos)
         num_units = len(storage_unit_keys)
         gi_lists: dict[str, list[int]] = defaultdict(list)
         pos_lists: dict[str, list[int]] = defaultdict(list)
@@ -134,6 +142,13 @@ class AsyncSimpleStorageManager(StorageManager):
             gi_lists[key].append(global_idx)
             pos_lists[key].append(pos)
         return {key: RoutingGroup(gi_lists[key], pos_lists[key]) for key in gi_lists}
+
+    def _get_topology_info(self) -> dict[str, Any]:
+        """Expose SU -> node_ip mapping so the controller can build a placement table."""
+        return {
+            "ordered_su_ids": list(self.storage_unit_infos),
+            "su_node_map": getattr(self, "_su_to_node", {}),
+        }
 
     @staticmethod
     def _select_by_positions(field_data, positions: list[int]):
@@ -216,13 +231,16 @@ class AsyncSimpleStorageManager(StorageManager):
             return field_data[positions]
 
     async def put_data(
-        self, data: TensorDict, metadata: BatchMeta, data_parser: Callable[[Any], Any] | None = None
+        self,
+        data: TensorDict,
+        metadata: BatchMeta,
+        data_parser: Callable[[Any], Any] | None = None,
     ) -> None:
         """
         Send data to remote StorageUnit based on metadata.
 
-        Routes each sample to its target SU using global_idx % num_su (hash routing).
-        Complexity: O(F) for schema extraction + O(S) for data distribution.
+        Routes each sample to its target SU using ``global_idx % num_su`` and
+        the registered SU order shared with GET and CLEAR.
 
         Args:
             data: TensorDict containing the data to store.
