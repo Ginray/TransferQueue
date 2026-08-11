@@ -16,7 +16,8 @@
 import math
 from typing import Any
 
-from omegaconf import DictConfig
+import ray
+from omegaconf import DictConfig, OmegaConf
 
 from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
@@ -34,6 +35,9 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     simple_storage_handles = {}
     num_data_storage_units = conf.backend.SimpleStorage.num_data_storage_units
     total_storage_size = conf.backend.SimpleStorage.get("total_storage_size", None)
+    payload_transport = conf.backend.SimpleStorage.get("payload_transport", None)
+    payload_transport = OmegaConf.to_container(payload_transport, resolve=True) if payload_transport else {}
+    payload_transport_enabled = bool(payload_transport.get("enabled", False))
     scheduling_strategies = get_node_round_robin_scheduling_strategies(num_data_storage_units)
 
     # Compute per-unit capacity: None means unlimited
@@ -47,6 +51,7 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
             name=f"TransferQueueStorageUnit#{storage_unit_rank}",
         ).remote(
             storage_unit_size=storage_unit_size,
+            payload_transport_enabled=payload_transport_enabled,
         )
         simple_storage_handles[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
         logger.info(
@@ -57,5 +62,14 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     storage_zmq_info = process_zmq_server_info(simple_storage_handles)
     backend_name = conf.backend.storage_backend
     conf.backend[backend_name].zmq_info = storage_zmq_info
+    if payload_transport_enabled:
+        transport_infos = ray.get(
+            [storage.get_payload_transport_info.remote() for storage in simple_storage_handles.values()]
+        )
+        if all(transport_infos):
+            conf.backend[backend_name].payload_transport_infos = {info["id"]: info for info in transport_infos}
+        else:
+            conf.backend[backend_name].payload_transport_infos = {}
+            logger.warning("UCX is unavailable on at least one StorageUnit; all clients will use ZMQ payloads.")
 
     return simple_storage_handles

@@ -17,18 +17,27 @@ import os
 import pickle
 import time
 import weakref
+from dataclasses import dataclass
+from functools import partial
 from threading import Event, Thread
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
 import psutil
 import ray
 import zmq
 
+from transfer_queue.storage.data_plane import (
+    DEFAULT_INLINE_THRESHOLD_BYTES,
+    PayloadDescriptor,
+    address_digest,
+    create_data_plane,
+)
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
+from transfer_queue.utils.serial_utils import decode, encode, pack_frames, unpack_frames
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -46,6 +55,21 @@ logger = get_logger(__name__)
 
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))  # in seconds
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
+
+
+@dataclass
+class _PendingPut:
+    descriptor: PayloadDescriptor
+    sender_id: str
+    global_indexes: tuple[int, ...]
+    data_parser: Any
+
+
+@dataclass
+class _PendingGet:
+    descriptor: PayloadDescriptor
+    sender_id: str
+    start_send: Callable[[], Any]
 
 
 class StorageUnitData:
@@ -154,7 +178,7 @@ class SimpleStorageUnit:
         zmq_server_info: ZMQ connection information for clients.
     """
 
-    def __init__(self, storage_unit_size: int | None = None):
+    def __init__(self, storage_unit_size: int | None = None, payload_transport_enabled: bool = False):
         """Initialize a SimpleStorageUnit with the specified size.
 
         Args:
@@ -163,8 +187,16 @@ class SimpleStorageUnit:
         """
         self.storage_unit_id = f"TQ_STORAGE_UNIT_{uuid4().hex[:8]}"
         self.storage_unit_size = storage_unit_size
+        self._node_ip = get_node_ip_address()
 
         self.storage_data = StorageUnitData(self.storage_unit_size)
+        self.data_plane = create_data_plane(payload_transport_enabled, local_ip=self._node_ip)
+        self.inline_threshold_bytes = DEFAULT_INLINE_THRESHOLD_BYTES
+        self._pending_puts: dict[str, _PendingPut] = {}
+        # The submitted UCX operation owns the payload/frame references until
+        # completion. Keep only the protocol state needed by GET_COMMIT here,
+        # avoiding a second large-payload reference while the request is live.
+        self._pending_gets: dict[str, _PendingGet] = {}
 
         # Internal communication address for proxy and workers
         self._inproc_addr = f"inproc://simple_storage_workers_{self.storage_unit_id}"
@@ -192,6 +224,7 @@ class SimpleStorageUnit:
             self.proxy_thread,
             self.zmq_context,
             self.put_get_socket,
+            self.data_plane,
         )
 
     def _init_zmq_socket(self) -> None:
@@ -201,8 +234,6 @@ class SimpleStorageUnit:
         - worker_socket (DEALER): Backend socket for worker communication.
         """
         self.zmq_context = zmq.Context()
-        self._node_ip = get_node_ip_address()
-
         # Frontend: ROUTER for receiving client requests
         self.put_get_socket = create_zmq_socket(self.zmq_context, zmq.ROUTER, self._node_ip)
 
@@ -303,9 +334,21 @@ class SimpleStorageUnit:
                     if operation == ZMQRequestType.PUT_DATA:  # type: ignore[arg-type]
                         with monitor.measure(op_type="PUT_DATA"):
                             response_msg = self._handle_put(request_msg)
+                    elif operation == ZMQRequestType.PUT_DATA_PREPARE:
+                        response_msg = self._handle_put_prepare(request_msg)
+                    elif operation == ZMQRequestType.PUT_DATA_COMMIT:
+                        response_msg = self._handle_put_commit(request_msg)
+                    elif operation == ZMQRequestType.PUT_DATA_CANCEL:
+                        response_msg = self._handle_put_cancel(request_msg)
                     elif operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
                         with monitor.measure(op_type="GET_DATA"):
                             response_msg = self._handle_get(request_msg)
+                    elif operation == ZMQRequestType.GET_DATA_PREPARE:
+                        response_msg = self._handle_get_prepare(request_msg)
+                    elif operation == ZMQRequestType.GET_DATA_COMMIT:
+                        response_msg = self._handle_get_commit(request_msg)
+                    elif operation == ZMQRequestType.GET_DATA_CANCEL:
+                        response_msg = self._handle_get_cancel(request_msg)
                     elif operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
                         with monitor.measure(op_type="CLEAR_DATA"):
                             response_msg = self._handle_clear(request_msg)
@@ -363,49 +406,7 @@ class SimpleStorageUnit:
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_put"
             ):
-                if data_parser is not None:
-                    if not callable(data_parser):
-                        raise TypeError(f"data_parser must be callable, got {type(data_parser).__name__}")
-
-                    original_keys = set(field_data.keys())
-                    original_lengths = {}
-                    for k, v in field_data.items():
-                        if hasattr(v, "shape") and isinstance(v.shape, tuple | list) and len(v.shape) > 0:
-                            original_lengths[k] = v.shape[0]
-                        else:
-                            try:
-                                original_lengths[k] = len(v)
-                            except Exception:
-                                original_lengths[k] = None
-
-                    field_data = data_parser(field_data)
-
-                    if not isinstance(field_data, dict):
-                        raise TypeError(f"data_parser must return a dict, got {type(field_data).__name__}")
-
-                    new_keys = set(field_data.keys())
-                    if new_keys != original_keys:
-                        raise ValueError(
-                            f"data_parser must not change dict keys. "
-                            f"Original keys: {sorted(original_keys)}, got: {sorted(new_keys)}"
-                        )
-
-                    for k, v in field_data.items():
-                        if hasattr(v, "shape") and isinstance(v.shape, tuple | list) and len(v.shape) > 0:
-                            new_len = v.shape[0]
-                        else:
-                            try:
-                                new_len = len(v)
-                            except Exception:
-                                new_len = None
-
-                        orig_len = original_lengths[k]
-                        if orig_len is not None and new_len is not None and orig_len != new_len:
-                            raise ValueError(
-                                f"data_parser changed the number of elements for key '{k}': "
-                                f"expected {orig_len}, got {new_len}"
-                            )
-                self.storage_data.put_data(field_data, global_indexes)
+                self._put_decoded_data(global_indexes, field_data, data_parser)
 
             # After put operation finish, send a message to the client
             response_msg = ZMQMessage.create(
@@ -465,6 +466,216 @@ class SimpleStorageUnit:
                 },
             )
         return response_msg
+
+    def _handle_put_prepare(self, data_parts: ZMQMessage) -> ZMQMessage:
+        """Post the UCX receive before acknowledging a large PUT descriptor."""
+        if self.data_plane is None:
+            return self._data_plane_error("PUT prepare received while UCX payload transport is unavailable")
+        try:
+            descriptor = PayloadDescriptor.from_dict(data_parts.body["descriptor"])
+            if descriptor.transfer_id in self._pending_puts:
+                raise RuntimeError(f"duplicate PUT transfer_id: {descriptor.transfer_id}")
+            global_indexes = tuple(data_parts.body["global_indexes"])
+            self.data_plane.prepare_receive(descriptor)
+            self._pending_puts[descriptor.transfer_id] = _PendingPut(
+                descriptor=descriptor,
+                sender_id=data_parts.sender_id,
+                global_indexes=global_indexes,
+                data_parser=data_parts.body.get("data_parser"),
+            )
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.PUT_DATA_READY,
+                sender_id=self.storage_unit_id,
+                body={"descriptor": descriptor.to_dict()},
+            )
+        except Exception as e:
+            return self._data_plane_error(f"PUT prepare failed: {e}")
+
+    def _handle_put_commit(self, data_parts: ZMQMessage) -> ZMQMessage:
+        """Consume a completed UCX PUT and commit it through the legacy store path."""
+        transfer_id = data_parts.body["transfer_id"]
+        owns_receive = False
+        try:
+            pending = self._pending_puts.get(transfer_id)
+            if pending is None:
+                raise RuntimeError(f"unknown or expired PUT transfer_id: {transfer_id}")
+            if pending.sender_id != data_parts.sender_id:
+                raise RuntimeError(f"PUT transfer {transfer_id} belongs to another sender")
+            self._pending_puts.pop(transfer_id)
+            owns_receive = True
+            payload = self.data_plane.finish_receive(pending.descriptor) if self.data_plane else None
+            if payload is None:
+                raise RuntimeError("UCX payload transport is unavailable")
+            frames = unpack_frames(payload)
+            if len(frames) != pending.descriptor.frame_count:
+                raise RuntimeError(
+                    f"PUT frame count mismatch: expected {pending.descriptor.frame_count}, got {len(frames)}"
+                )
+            field_data = decode(frames)
+            self._put_decoded_data(list(pending.global_indexes), field_data, pending.data_parser)
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.PUT_DATA_RESPONSE,
+                sender_id=self.storage_unit_id,
+                body={"route": "ucx"},
+            )
+        except Exception as e:
+            if owns_receive and self.data_plane is not None:
+                self.data_plane.cancel_receive(transfer_id)
+            return self._data_plane_error(f"PUT commit failed: {e}")
+
+    def _handle_put_cancel(self, data_parts: ZMQMessage) -> ZMQMessage:
+        """Release a prepared UCX PUT that will not be committed."""
+        transfer_id = data_parts.body["transfer_id"]
+        pending = self._pending_puts.get(transfer_id)
+        if pending is not None and pending.sender_id != data_parts.sender_id:
+            return self._data_plane_error(f"PUT transfer {transfer_id} belongs to another sender")
+        pending = self._pending_puts.pop(transfer_id, None)
+        if pending is not None and self.data_plane is not None:
+            self.data_plane.cancel_receive(transfer_id)
+        return ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_DATA_RESPONSE,
+            sender_id=self.storage_unit_id,
+            body={"route": "ucx_cancelled", "transfer_id": transfer_id},
+        )
+
+    def get_data_plane_pending_counts(self) -> dict[str, int]:
+        """Return internal UCX pending counts for lifecycle diagnostics."""
+        return {
+            "pending_puts": len(self._pending_puts),
+            "pending_gets": len(self._pending_gets),
+            "pending_receives": self.data_plane.pending_receive_count if self.data_plane is not None else 0,
+        }
+
+    def _handle_get_prepare(self, data_parts: ZMQMessage) -> ZMQMessage:
+        """Encode GET data and retain it until the requester posts its receive."""
+        if self.data_plane is None:
+            return self._data_plane_error("GET prepare received while UCX payload transport is unavailable")
+        try:
+            descriptor = PayloadDescriptor.from_dict(data_parts.body["descriptor"])
+            descriptor.validate_identity()
+            if descriptor.transfer_id in self._pending_gets:
+                raise RuntimeError(f"duplicate GET transfer_id: {descriptor.transfer_id}")
+            fields = data_parts.body["fields"]
+            global_indexes = data_parts.body["global_indexes"]
+            # StorageUnitData.get_data() gathers existing Python references; it
+            # does not perform tensor aggregation or mutate PyTorch settings.
+            result_data = self.storage_data.get_data(fields, global_indexes)
+            encoded_frames = encode(result_data)
+            frame_count = len(encoded_frames)
+            payload = pack_frames(encoded_frames)
+            if len(payload) < self.inline_threshold_bytes:
+                return ZMQMessage.create(
+                    request_type=ZMQRequestType.GET_DATA_READY,
+                    sender_id=self.storage_unit_id,
+                    body={"route": "zmq_inline", "data": result_data},
+                )
+            if len(payload) != descriptor.payload_bytes:
+                descriptor = PayloadDescriptor(
+                    transfer_id=descriptor.transfer_id,
+                    tag=descriptor.tag,
+                    payload_bytes=len(payload),
+                    frame_count=frame_count,
+                )
+            self._pending_gets[descriptor.transfer_id] = _PendingGet(
+                descriptor=descriptor,
+                sender_id=data_parts.sender_id,
+                start_send=partial(
+                    self.data_plane.send_async,
+                    data_parts.body["receiver_address"],
+                    descriptor,
+                    payload,
+                    peer_address_digest=data_parts.body.get("receiver_address_digest"),
+                ),
+            )
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.GET_DATA_READY,
+                sender_id=self.storage_unit_id,
+                body={"descriptor": descriptor.to_dict()},
+            )
+        except Exception as e:
+            return self._data_plane_error(f"GET prepare failed: {e}")
+
+    def _handle_get_commit(self, data_parts: ZMQMessage) -> ZMQMessage:
+        """Start a GET send after the requester has posted its receive."""
+        transfer_id = data_parts.body["transfer_id"]
+        try:
+            pending = self._pending_gets.get(transfer_id)
+            if pending is None:
+                raise RuntimeError(f"unknown or expired GET transfer_id: {transfer_id}")
+            if pending.sender_id != data_parts.sender_id:
+                raise RuntimeError(f"GET transfer {transfer_id} belongs to another sender")
+            self._pending_gets.pop(transfer_id)
+            if self.data_plane is None:
+                raise RuntimeError("UCX payload transport is unavailable")
+
+            # Do not acknowledge GET before the payload send completes.  If
+            # the send failed after an early response, the requester could
+            # wait forever on its receive future with no control-plane error.
+            pending.start_send().result()
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.GET_DATA_RESPONSE,
+                sender_id=self.storage_unit_id,
+                body={"descriptor": pending.descriptor.to_dict(), "route": "ucx"},
+            )
+        except Exception as e:
+            return self._data_plane_error(f"GET commit failed: {e}")
+
+    def _handle_get_cancel(self, data_parts: ZMQMessage) -> ZMQMessage:
+        """Discard a prepared GET before its send has started."""
+        transfer_id = data_parts.body["transfer_id"]
+        pending = self._pending_gets.get(transfer_id)
+        if pending is not None and pending.sender_id != data_parts.sender_id:
+            return self._data_plane_error(f"GET transfer {transfer_id} belongs to another sender")
+        self._pending_gets.pop(transfer_id, None)
+        return ZMQMessage.create(
+            request_type=ZMQRequestType.GET_DATA_RESPONSE,
+            sender_id=self.storage_unit_id,
+            body={"route": "ucx_cancelled", "transfer_id": transfer_id},
+        )
+
+    def _put_decoded_data(
+        self, global_indexes: list[int], field_data: dict[str, Any], data_parser: Any
+    ) -> dict[str, Any]:
+        """Store parsed data and return the exact dict representation that was committed."""
+        if data_parser is not None:
+            if not callable(data_parser):
+                raise TypeError(f"data_parser must be callable, got {type(data_parser).__name__}")
+            original_keys = set(field_data)
+            original_lengths = {key: self._field_length(value) for key, value in field_data.items()}
+            field_data = data_parser(field_data)
+            if not isinstance(field_data, dict):
+                raise TypeError(f"data_parser must return a dict, got {type(field_data).__name__}")
+            if set(field_data) != original_keys:
+                raise ValueError(
+                    f"data_parser must not change dict keys. Original keys: {sorted(original_keys)}, "
+                    f"got: {sorted(field_data)}"
+                )
+            for key, value in field_data.items():
+                original_length = original_lengths[key]
+                new_length = self._field_length(value)
+                if original_length is not None and new_length is not None and original_length != new_length:
+                    raise ValueError(
+                        f"data_parser changed the number of elements for key '{key}': "
+                        f"expected {original_length}, got {new_length}"
+                    )
+        self.storage_data.put_data(field_data, global_indexes)
+        return field_data
+
+    @staticmethod
+    def _field_length(value: Any) -> int | None:
+        if hasattr(value, "shape") and isinstance(value.shape, tuple | list) and len(value.shape) > 0:
+            return value.shape[0]
+        try:
+            return len(value)
+        except Exception:
+            return None
+
+    def _data_plane_error(self, message: str) -> ZMQMessage:
+        return ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_GET_ERROR,
+            sender_id=self.storage_unit_id,
+            body={"message": message},
+        )
 
     def _handle_clear(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
@@ -676,6 +887,7 @@ class SimpleStorageUnit:
         proxy_thread: Thread | None,
         zmq_context: zmq.Context | None,
         put_get_socket: zmq.Socket | None,
+        data_plane: Any | None,
     ) -> None:
         """Clean up resources on garbage collection."""
         logger.info("Shutting down SimpleStorageUnit resources...")
@@ -696,6 +908,9 @@ class SimpleStorageUnit:
             worker_thread.join(timeout=5)
         if proxy_thread and proxy_thread.is_alive():
             proxy_thread.join(timeout=5)
+
+        if data_plane is not None:
+            data_plane.close()
 
         logger.info("SimpleStorageUnit resources shutdown complete.")
 
@@ -727,3 +942,15 @@ class SimpleStorageUnit:
             ZMQServerInfo containing connection details for this storage unit.
         """
         return self.zmq_server_info
+
+    def get_payload_transport_info(self) -> dict[str, Any] | None:
+        """Return bootstrap-safe native endpoint data, never exposed to the public API."""
+        if self.data_plane is None:
+            return None
+        address = self.data_plane.address
+        return {
+            "id": self.storage_unit_id,
+            "provider": self.data_plane.provider,
+            "address": address,
+            "address_digest": address_digest(address),
+        }

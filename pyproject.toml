@@ -4,7 +4,8 @@
 [build-system]
 requires = [
     "setuptools>=61.0",
-    "wheel"
+    "wheel",
+    "pybind11>=2.12"
 ]
 build-backend = "setuptools.build_meta"
 
@@ -132,5 +133,6 @@ mooncake = [
 [tool.setuptools.package-data]
 transfer_queue = [
     "version/*",
-    "*.yaml"
+    "*.yaml",
+    "native/ucx/*.cpp"
 ]
