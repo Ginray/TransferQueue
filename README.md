@@ -211,6 +211,10 @@ pip install TransferQueue
    pip install dist/*.whl
    ```
 
+For the optional SimpleStorage UCX Host RDMA path, including official UCX installation,
+native extension build, configuration, and lane verification, see the
+[TQ UCX Host RDMA developer guide](docs/ucx_rdma_developer_guide.md).
+
 <h2 id="performance">📊 Performance</h2>
 
 ### Simple Case: Regular Tensor
