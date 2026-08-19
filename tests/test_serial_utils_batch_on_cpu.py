@@ -22,6 +22,8 @@
 * ``batch_decode_from``
 """
 
+import struct
+
 import numpy as np
 import pytest
 import torch
@@ -62,6 +64,17 @@ def test_unpack_from_zero_item_buffer():
     buf = bytearray(sz)
     serial_utils.pack_into(buf, items)
     assert serial_utils.unpack_from(buf) == []
+
+
+def test_unpack_from_rejects_invalid_frame_bounds():
+    items = [b"payload"]
+    buf = bytearray(serial_utils.calc_packed_size(items))
+    serial_utils.pack_into(buf, items)
+
+    # Corrupt the frame offset so it points into the frame table.
+    struct.pack_into("<Q", buf, 4, 4)
+    with pytest.raises(ValueError, match="outside the payload"):
+        serial_utils.unpack_from(buf)
 
 
 # ============================================================================

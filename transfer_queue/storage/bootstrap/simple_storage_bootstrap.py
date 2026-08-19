@@ -16,9 +16,11 @@
 import math
 from typing import Any
 
+import ray
 from omegaconf import DictConfig
 
 from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+from transfer_queue.storage.payload_transfer import normalize_payload_transfer
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
 from transfer_queue.utils.common import get_node_round_robin_scheduling_strategies
 from transfer_queue.utils.logging_utils import get_logger
@@ -34,6 +36,7 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     simple_storage_handles = {}
     num_data_storage_units = conf.backend.SimpleStorage.num_data_storage_units
     total_storage_size = conf.backend.SimpleStorage.get("total_storage_size", None)
+    payload_transfer = normalize_payload_transfer(conf.backend.SimpleStorage.get("payload_transfer", "zmq"))
     scheduling_strategies = get_node_round_robin_scheduling_strategies(num_data_storage_units)
 
     # Compute per-unit capacity: None means unlimited
@@ -47,6 +50,7 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
             name=f"TransferQueueStorageUnit#{storage_unit_rank}",
         ).remote(
             storage_unit_size=storage_unit_size,
+            payload_transfer=payload_transfer,
         )
         simple_storage_handles[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
         logger.info(
@@ -57,5 +61,12 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     storage_zmq_info = process_zmq_server_info(simple_storage_handles)
     backend_name = conf.backend.storage_backend
     conf.backend[backend_name].zmq_info = storage_zmq_info
+    if payload_transfer != "zmq":
+        transfer_infos = ray.get(
+            [storage.get_payload_transfer_info.remote() for storage in simple_storage_handles.values()]
+        )
+        if not all(transfer_infos):
+            raise RuntimeError("SimpleStorage payload transfer did not initialize on every StorageUnit")
+        conf.backend[backend_name].payload_transfer_infos = {info["id"]: info for info in transfer_infos}
 
     return simple_storage_handles

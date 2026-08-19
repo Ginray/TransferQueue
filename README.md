@@ -211,6 +211,9 @@ pip install TransferQueue
    pip install dist/*.whl
    ```
 
+For the optional SimpleStorage UCX Host RDMA payload path, see
+[the SimpleStorage UCX RDMA payload guide](docs/ucx_rdma_payload.md).
+
 <h2 id="performance">📊 Performance</h2>
 
 ### Simple Case: Regular Tensor
