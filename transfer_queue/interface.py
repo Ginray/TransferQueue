@@ -1005,7 +1005,8 @@ def save_checkpoint(
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
 
     checkpoint_dir = Path(checkpoint_dir)
-    tmp_dir = checkpoint_dir.parent / (checkpoint_dir.name + ".tmp")
+    tmp_dir = checkpoint_dir.parent / f"{checkpoint_dir.name}.tmp"
+    old_dir = checkpoint_dir.parent / f"{checkpoint_dir.name}.old"
 
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
@@ -1039,15 +1040,25 @@ def save_checkpoint(
         with open(tmp_dir / _METADATA_FILE, "w") as f:
             json.dump(meta_content, f, indent=2)
 
+        # Atomic replacement: move old aside, move new in place, delete old
         if checkpoint_dir.exists():
-            shutil.rmtree(checkpoint_dir)
+            if old_dir.exists():
+                shutil.rmtree(old_dir)
+            checkpoint_dir.rename(old_dir)
+
         tmp_dir.rename(checkpoint_dir)
+
+        if old_dir.exists():
+            shutil.rmtree(old_dir)
 
         logger.info(f"Checkpoint saved to {checkpoint_dir}")
 
     except Exception:
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
+        if old_dir.exists() and not checkpoint_dir.exists():
+            # Restore old checkpoint if new one failed
+            old_dir.rename(checkpoint_dir)
         raise
 
 
@@ -1072,6 +1083,14 @@ def load_checkpoint(
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
 
     checkpoint_dir = Path(checkpoint_dir)
+    old_dir = checkpoint_dir.parent / f"{checkpoint_dir.name}.old"
+
+    if not checkpoint_dir.exists() and old_dir.exists():
+        # A prior save_checkpoint crashed between renaming checkpoint_dir aside
+        # and installing the new version; roll back to the pre-crash checkpoint.
+        logger.warning(f"Found interrupted checkpoint replacement; restoring {old_dir} to {checkpoint_dir}")
+        old_dir.rename(checkpoint_dir)
+
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
 

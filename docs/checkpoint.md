@@ -44,7 +44,7 @@ def save_checkpoint(
 
 | Parameter | Description |
 |-----------|-------------|
-| `checkpoint_dir` | Directory to write the checkpoint. Created if it does not exist. If a checkpoint already exists at this path it is replaced (best-effort; see [Known Limitations §3](#3-replacing-an-existing-checkpoint-is-not-fully-atomic)). |
+| `checkpoint_dir` | Directory to write the checkpoint. Created if it does not exist. If a checkpoint already exists at this path, it is atomically replaced using a `.tmp` + `.old` mechanism (see [Atomic Checkpoint Replacement](#atomic-checkpoint-replacement)). |
 | `include_storage` | Whether to save storage unit data. For `SimpleStorage` (in-memory), this is forced to `True` regardless of the value passed — skipping storage would cause complete data loss on restart. For persistent external backends, `False` is valid. |
 | `metadata` | Optional user-defined key-value pairs written into `metadata.json`. Useful for recording step number, timestamp, etc. |
 
@@ -99,6 +99,12 @@ checkpoint_dir/
 ]
 ```
 
+## Atomic Checkpoint Replacement
+
+`save_checkpoint` writes to `<checkpoint_dir>.tmp`, renames the existing `checkpoint_dir` to `<checkpoint_dir>.old`, renames `.tmp` into `checkpoint_dir`, then deletes `.old`. This keeps the old checkpoint recoverable until the new one is fully in place; a failure partway through restores `.old` automatically, and the directory stays a plain folder (no symlink).
+
+POSIX `rename()` can't atomically swap two existing directories, so `checkpoint_dir` is briefly absent between the second and third steps. If the process crashes in that window, `load_checkpoint` detects the missing `checkpoint_dir` with a leftover `.old` and restores it automatically before loading. A concurrent `load_checkpoint` call landing in that same narrow window may see a transient `FileNotFoundError`.
+
 ## Architecture
 
 ```
@@ -139,15 +145,7 @@ On load, the number of storage units in the checkpoint must exactly match the ru
 
 ## Known Limitations
 
-### 1. Controller request thread can hang on checkpoint I/O failure
-
-The controller's request loop currently has no error handling around the checkpoint branches. If `save_checkpoint` or `load_checkpoint` raises (e.g., the path is not writable, or the pickle file is corrupt), the exception propagates up and kills the request thread. The client's `recv_multipart` call will block indefinitely.
-
-**Workaround**: Ensure the checkpoint path is writable and the target file is not corrupt before calling. Verify disk space and file system permissions ahead of time.
-
----
-
-### 2. Save consistency is not guaranteed under concurrent clears
+### 1. Save consistency is not guaranteed under concurrent clears
 
 See [Save Order and Consistency](#save-order-and-consistency) above. Concurrent `clear_partition` or `clear_samples` during `save_checkpoint` can produce a checkpoint whose controller view references storage entries that no longer exist.
 
@@ -155,23 +153,7 @@ See [Save Order and Consistency](#save-order-and-consistency) above. Concurrent 
 
 ---
 
-### 3. Replacing an existing checkpoint is not fully atomic
-
-The current save sequence is:
-
-```python
-if checkpoint_dir.exists():
-    shutil.rmtree(checkpoint_dir)   # (1) old directory deleted
-tmp_dir.rename(checkpoint_dir)      # (2) new directory moved into place
-```
-
-If step (2) fails after step (1) (e.g., cross-device rename, disk full), the old checkpoint has already been deleted and the new one is also cleaned up by the exception handler — both copies are lost.
-
-**Workaround**: Maintain an additional copy of the previous checkpoint (e.g., save to `step_N` while keeping `step_N-1`) so a failure at step N leaves `step_N-1` intact.
-
----
-
-### 4. Load is not transactional — partial restore has no rollback
+### 2. Load is not transactional — partial restore has no rollback
 
 The load sequence is:
 
