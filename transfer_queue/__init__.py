@@ -43,6 +43,7 @@ from .sampler.grpo_group_n_sampler import GRPOGroupNSampler
 from .sampler.rank_aware_sampler import RankAwareSampler
 from .sampler.seqlen_balanced_sampler import SeqlenBalancedSampler
 from .sampler.sequential_sampler import SequentialSampler
+from .storage import StorageKeyNotFoundError
 
 __all__ = (
     [
@@ -79,6 +80,7 @@ __all__ = (
         "get_client",
         "BatchMeta",
         "TransferQueueClient",
+        "StorageKeyNotFoundError",
     ]
     + [
         # Sampler

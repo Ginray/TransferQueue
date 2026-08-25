@@ -29,6 +29,7 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
+from transfer_queue.storage.simple_storage import KEY_NOT_FOUND_MARKER, StorageKeyNotFoundError
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
@@ -410,11 +411,14 @@ class AsyncSimpleStorageManager(StorageManager):
         try:
             results = await asyncio.gather(*tasks)
         except Exception as e:
-            logger.error(
+            # The offending unit is named in the error itself; the full routing list can run to
+            # hundreds of ids, which buries it.
+            log = logger.debug if isinstance(e, StorageKeyNotFoundError) else logger.error
+            log(
                 f"[{self.storage_manager_id}]: get_data failed. "
                 f"partition_id={metadata.partition_ids[0]}, "
                 f"num_samples={metadata.size}, "
-                f"storage_units={list(routing.keys())}, "
+                f"num_storage_units={len(routing)}, "
                 f"error={type(e).__name__}: {e}"
             )
             raise
@@ -456,10 +460,9 @@ class AsyncSimpleStorageManager(StorageManager):
                 storage_unit_data = response_msg.body["data"]
                 return fields, storage_unit_data
             else:
-                raise RuntimeError(
-                    f"Failed to get data from storage unit {target_storage_unit}: "
-                    f"{response_msg.body.get('message', 'Unknown error')}"
-                )
+                message = response_msg.body.get("message", "Unknown error")
+                error_type = StorageKeyNotFoundError if KEY_NOT_FOUND_MARKER in message else RuntimeError
+                raise error_type(f"Failed to get data from storage unit {target_storage_unit}: {message}")
         except zmq.error.Again as e:
             timeout_sec = TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT
             logger.error(
@@ -468,6 +471,9 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"The storage unit may be overloaded or crashed."
             )
             raise RuntimeError(f"ZMQ recv timeout ({timeout_sec}s) from storage unit {target_storage_unit}") from e
+        except StorageKeyNotFoundError:
+            # Already logged at debug by the storage unit; propagate for the caller to classify.
+            raise
         except Exception as e:
             logger.error(
                 f"[{self.storage_manager_id}]: Unexpected error from storage unit "

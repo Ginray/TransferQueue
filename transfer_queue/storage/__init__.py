@@ -21,11 +21,12 @@ from .managers import (
     StorageManagerFactory,
     YuanrongStorageManager,
 )
-from .simple_storage import SimpleStorageUnit, StorageUnitData
+from .simple_storage import SimpleStorageUnit, StorageKeyNotFoundError, StorageUnitData
 
 __all__ = [
     "SimpleStorageUnit",
     "StorageUnitData",
+    "StorageKeyNotFoundError",
     "StorageManager",
     "StorageManagerFactory",
     "AsyncSimpleStorageManager",

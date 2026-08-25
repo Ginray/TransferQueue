@@ -47,6 +47,18 @@ logger = get_logger(__name__)
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))  # in seconds
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 
+# Marks a GET_ERROR reply as "the key is gone" so the caller can tell it apart from a real fault.
+KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
+
+
+class StorageKeyNotFoundError(KeyError):
+    """Raised when a requested global index is absent from a storage unit.
+
+    Reads and ``clear`` are concurrent by design, so a key returned by ``kv_retrieve_meta`` can be
+    cleared before ``get_data`` reaches the storage unit. Callers that tolerate that race catch this
+    instead of matching on message text.
+    """
+
 
 class StorageUnitData:
     """Storage unit for managing 2D data structure (samples × fields).
@@ -93,7 +105,7 @@ class StorageUnitData:
             try:
                 result[field] = [self.field_data[field][k] for k in global_indexes]
             except KeyError as e:
-                raise KeyError(f"StorageUnitData get_data: key {e} not found in field '{field}'") from e
+                raise StorageKeyNotFoundError(f"StorageUnitData get_data: key {e} not found in field '{field}'") from e
         return result
 
     def put_data(self, field_data: dict[str, Any], global_indexes: list) -> None:
@@ -452,15 +464,18 @@ class SimpleStorageUnit:
                 },
             )
         except Exception as e:
-            logger.error(
+            key_not_found = isinstance(e, StorageKeyNotFoundError)
+            log = logger.debug if key_not_found else logger.error
+            log(
                 f"[{self.storage_unit_id}]: _handle_get error, "
                 f"fields={fields}, global_indexes={global_indexes}: {type(e).__name__}: {e}"
             )
+            marker = f"[{KEY_NOT_FOUND_MARKER}] " if key_not_found else ""
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.GET_ERROR,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
                 body={
-                    "message": f"Failed to get data from storage unit id #{self.storage_unit_id}, "
+                    "message": f"{marker}Failed to get data from storage unit id #{self.storage_unit_id}, "
                     f"detail error message: {str(e)}"
                 },
             )
