@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from threading import Event
 
@@ -30,6 +31,7 @@ from transfer_queue.storage.payload_transfer import (
     TransferEndpoint,
     create_payload_transfer,
 )
+from transfer_queue.storage.payload_transfer.nixl import NixlPayloadTransfer
 from transfer_queue.storage.payload_transfer.ucx import UcxPayloadTransfer
 from transfer_queue.storage.payload_transfer.ucx_discovery import (
     UcxDeviceSelection,
@@ -159,27 +161,33 @@ def test_payload_descriptor_is_always_complete_when_deserialized():
         PayloadDescriptor.from_dict({"transfer_id": "payload", "payload_bytes": -1})
 
 
-def test_ucx_adapter_derives_tag_instead_of_sending_it_in_control_metadata():
+def test_payload_descriptor_preserves_frame_layout():
+    descriptor = PayloadDescriptor("framed", 8 + 16 * 2 + 5, (2, 3))
+    descriptor.validate()
+    restored = PayloadDescriptor.from_dict(descriptor.to_dict())
+    assert restored == descriptor
+
+    with pytest.raises(PayloadTransferError, match="packed payload length"):
+        PayloadDescriptor("framed", 5, (2, 3)).validate()
+
+
+def test_ucx_adapter_sends_encoded_frames_without_packing():
     class Runtime:
         address = b"a" * 32
 
-        def prepare_receive(self, transfer):
-            self.prepared = transfer
-
-        def send_async(self, address, transfer, payload, digest):
-            self.sent = address, transfer, payload, digest
-            return "future"
+        def send(self, address, transfer, frames, digest):
+            self.sent = address, transfer, frames, digest
+            return "frame-future"
 
     adapter = UcxPayloadTransfer.__new__(UcxPayloadTransfer)
     adapter._runtime = Runtime()
-    descriptor = PayloadDescriptor("payload", 3)
-
-    token = adapter.prepare_receive(descriptor)
-    assert token == ReceiveToken(data={})
+    frames = (b"ab", b"cde")
+    descriptor = PayloadDescriptor("framed", 8 + 16 * 2 + 5, (2, 3))
     endpoint = TransferEndpoint("ucx", {"address": b"b" * 32})
-    assert adapter.send(endpoint, token, descriptor, b"abc") == "future"
-    assert adapter._runtime.prepared.tag == transfer_tag("payload")
-    assert adapter._runtime.sent[1].tag == transfer_tag("payload")
+
+    assert adapter.send(endpoint, ReceiveToken(data={}), descriptor, frames) == "frame-future"
+    assert adapter._runtime.sent[2] == frames
+    assert adapter._runtime.sent[1].frame_sizes == (2, 3)
 
 
 def test_ucx_runtime_direct_send_receive_roundtrip():
@@ -197,8 +205,8 @@ def test_ucx_runtime_direct_send_receive_roundtrip():
             return self.target
 
     class Worker:
-        def post_receive(self, tag, size):
-            return Receive(tag, bytearray(size))
+        def post_receive_into(self, tag, target):
+            return Receive(tag, target)
 
     class Endpoint:
         def post_send(self, tag, payload):
@@ -208,19 +216,22 @@ def test_ucx_runtime_direct_send_receive_roundtrip():
     plane = UcxRuntime.__new__(UcxRuntime)
     plane._timeout_seconds = 1
     plane._receives = {}
+    plane._receive_buffers = {}
+    plane._reusable_receive_buffer = None
     plane._worker = Worker()
     plane._closed = False
     plane._call = lambda operation: operation()
     peer_address = b"p" * 32
     plane._endpoints = {peer_address: Endpoint()}
     transfer_id = "direct-roundtrip"
-    descriptor = UcxTransfer(transfer_id, transfer_tag(transfer_id), 10)
+    descriptor = UcxTransfer(transfer_id, transfer_tag(transfer_id), 8 + 16 + 10, (10,))
 
     plane.prepare_receive(descriptor)
-    send = plane._post_send(peer_address, None, descriptor, b"abcdefghij")
-    assert send.test() == "done"
+    send = plane._post_send(peer_address, None, descriptor, (b"abcdefghij",))
+    assert send.test() is True
 
-    assert bytes(plane.finish_receive(descriptor)) == b"abcdefghij"
+    payload = plane.finish_receive(descriptor)
+    assert bytes(payload[24:]) == b"abcdefghij"
 
 
 def test_peer_address_digest_is_checked_before_ucx_submission():
@@ -385,6 +396,20 @@ def test_ucx_info_discovery_supports_lib64_installations(monkeypatch, tmp_path):
         ucx_discovery._discover_ucx_transports.cache_clear()
 
 
+def test_ucx_info_discovery_uses_tq_ucx_home(monkeypatch, tmp_path):
+    from transfer_queue.storage.payload_transfer import ucx_discovery
+
+    prefix = tmp_path / "ucx"
+    executable = prefix / "bin" / "ucx_info"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    executable.chmod(0o755)
+    monkeypatch.setenv("TQ_UCX_HOME", str(prefix))
+    monkeypatch.delenv("TQ_UCX_INFO", raising=False)
+
+    assert ucx_discovery._find_ucx_info() == executable
+
+
 def test_explicit_ucx_tls_overrides_runtime_selection(monkeypatch):
     monkeypatch.setenv("UCX_TLS", "tcp,self")
     monkeypatch.setenv("UCX_NET_DEVICES", "custom_hca:2,custom_eth")
@@ -450,8 +475,77 @@ def test_ucx_payload_transfer_rejects_tcp_only_tls(monkeypatch):
 
 
 def test_payload_transfer_rejects_unknown_implementation():
-    with pytest.raises(ValueError, match="expected 'zmq' or 'ucx'"):
+    with pytest.raises(ValueError, match="expected 'zmq', 'ucx' or 'nixl-ucx'"):
         create_payload_transfer("hixl")
+
+
+def test_nixl_adapter_preserves_payload_transfer_contract():
+    class Runtime:
+        agent_name = "receiver"
+
+        def endpoint_metadata(self):
+            return b"endpoint-metadata"
+
+        def prepare_receive(self, descriptor):
+            self.prepared = descriptor
+            return {
+                "agent_name": self.agent_name,
+                "agent_metadata": b"receive-metadata",
+                "frame_remote_descs": b"frame-remote-descs",
+                "payload_bytes": descriptor.payload_bytes,
+            }
+
+        def send(self, endpoint, token, descriptor, frames):
+            self.sent_frames = endpoint, token, descriptor, frames
+            return "frame-future"
+
+        def receive(self, descriptor):
+            self.received = descriptor
+            return "receive-future"
+
+        def cancel_receive(self, transfer_id):
+            self.cancelled = transfer_id
+
+        pending_receive_count = 1
+
+        def close(self):
+            self.closed = True
+
+    adapter = NixlPayloadTransfer.__new__(NixlPayloadTransfer)
+    adapter._runtime = Runtime()
+    descriptor = PayloadDescriptor("nixl-contract", 8 + 16 + 3, (3,))
+
+    endpoint = adapter.endpoint()
+    token = adapter.prepare_receive(descriptor)
+    assert endpoint.transport == "nixl-ucx"
+    assert token.data["agent_name"] == "receiver"
+    assert adapter.send(endpoint, token, descriptor, (b"abc",)) == "frame-future"
+    assert adapter._runtime.sent_frames[3] == (b"abc",)
+    assert adapter.receive(descriptor) == "receive-future"
+    assert adapter.pending_receive_count == 1
+
+
+def test_nixl_reuses_ucx_discovery_for_missing_environment(monkeypatch):
+    from transfer_queue.storage.payload_transfer import nixl_runtime
+
+    class Selection:
+        rdma_device = "hns_0"
+        ucx_config = {
+            "TLS": "rc_verbs,tcp,sm,self",
+            "NET_DEVICES": "hns_0:1,enp189s0f0",
+            "IB_GID_INDEX": "3",
+            "IB_ADDR_TYPE": "ib_global",
+        }
+
+    for name in ("UCX_TLS", "UCX_NET_DEVICES", "UCX_IB_GID_INDEX", "UCX_IB_ADDR_TYPE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(nixl_runtime, "discover_ucx_device", lambda local_ip: Selection())
+
+    assert nixl_runtime._configure_ucx_environment("178.123.4.4") == Selection.ucx_config
+    assert os.environ["UCX_TLS"] == "rc_verbs,tcp,sm,self"
+    assert os.environ["UCX_NET_DEVICES"] == "hns_0:1,enp189s0f0"
+    assert os.environ["UCX_IB_GID_INDEX"] == "3"
+    assert os.environ["UCX_IB_ADDR_TYPE"] == "ib_global"
 
 
 def test_public_config_defaults_to_zmq_payload_transfer():

@@ -213,6 +213,9 @@ pip install TransferQueue
 
 For the optional SimpleStorage UCX Host RDMA payload path, see
 [the SimpleStorage UCX RDMA payload guide](docs/ucx_rdma_payload.md).
+For the NIXL-UCX setup and the measured ZMQ/UCX/NIXL-UCX results, see
+[the NIXL-UCX payload guide](docs/nixl_ucx_payload.md) and
+[the validation report](docs/ucx_zmq_nixl_performance.md).
 
 <h2 id="performance">📊 Performance</h2>
 

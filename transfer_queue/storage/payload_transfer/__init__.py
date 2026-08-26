@@ -27,6 +27,7 @@ from transfer_queue.storage.payload_transfer.factory import (
     create_payload_transfer,
     normalize_payload_transfer,
 )
+from transfer_queue.storage.payload_transfer.nixl import NixlPayloadTransfer
 
 __all__ = [
     "DEFAULT_INLINE_PAYLOAD_BYTES",
@@ -37,4 +38,5 @@ __all__ = [
     "TransferEndpoint",
     "create_payload_transfer",
     "normalize_payload_transfer",
+    "NixlPayloadTransfer",
 ]

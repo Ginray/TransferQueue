@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""UCX implementation of the SimpleStorage payload transfer contract."""
+"""NIXL H2H implementation of the SimpleStorage payload transfer contract."""
 
 from __future__ import annotations
 
@@ -26,32 +26,36 @@ from transfer_queue.storage.payload_transfer.base import (
     ReceiveToken,
     TransferEndpoint,
 )
-from transfer_queue.storage.payload_transfer.ucx_runtime import (
-    UcxTransfer,
-    address_digest,
-    create_ucx_runtime,
-    transfer_tag,
+from transfer_queue.storage.payload_transfer.nixl_runtime import (
+    NixlError,
+    create_nixl_runtime,
 )
 
 
-class UcxPayloadTransfer(PayloadTransfer):
-    """Adapt UCX Tagged operations to the payload transfer contract."""
+class NixlPayloadTransfer(PayloadTransfer):
+    """Adapt NIXL DRAM ``WRITE`` operations to the payload transfer contract."""
 
-    transport = "ucx"
+    transport = "nixl-ucx"
 
     def __init__(self, local_ip: str | None = None):
-        self._runtime = create_ucx_runtime(local_ip)
+        try:
+            self._runtime = create_nixl_runtime(local_ip)
+        except NixlError:
+            raise
+        except Exception as exc:
+            raise NixlError(f"failed to create NIXL runtime: {exc}") from exc
 
     def endpoint(self) -> TransferEndpoint:
-        address = self._runtime.address
         return TransferEndpoint(
             transport=self.transport,
-            data={"address": address, "address_digest": address_digest(address)},
+            data={
+                "agent_name": self._runtime.agent_name,
+                "agent_metadata": self._runtime.endpoint_metadata(),
+            },
         )
 
     def prepare_receive(self, descriptor: PayloadDescriptor) -> ReceiveToken:
-        self._runtime.prepare_receive(self._ucx_transfer(descriptor))
-        return ReceiveToken(data={})
+        return ReceiveToken(data=self._runtime.prepare_receive(descriptor))
 
     def send(
         self,
@@ -60,20 +64,12 @@ class UcxPayloadTransfer(PayloadTransfer):
         descriptor: PayloadDescriptor,
         frames: tuple[bytes | bytearray | memoryview, ...] | list[bytes | bytearray | memoryview],
     ) -> Future[None]:
-        """Send the encoder's frames directly as tagged UCX messages."""
-        self._validate_peer_metadata(endpoint, token, descriptor)
-        if not descriptor.frame_sizes:
-            raise PayloadTransferError("UCX direct frame send requires frame sizes")
-        transfer = self._ucx_transfer(descriptor)
-        return self._runtime.send(
-            endpoint.data["address"],
-            transfer,
-            tuple(frames),
-            endpoint.data.get("address_digest"),
-        )
+        """Send encoded frames directly through NIXL scatter-gather."""
+        self._validate_metadata(endpoint, token, descriptor)
+        return self._runtime.send(endpoint.data, token.data, descriptor, tuple(frames))
 
     def receive(self, descriptor: PayloadDescriptor) -> Future[memoryview]:
-        return self._runtime.finish_receive_future(self._ucx_transfer(descriptor))
+        return self._runtime.receive(descriptor)
 
     def cancel_receive(self, transfer_id: str) -> None:
         self._runtime.cancel_receive(transfer_id)
@@ -89,25 +85,17 @@ class UcxPayloadTransfer(PayloadTransfer):
         self._runtime.close()
 
     @staticmethod
-    def _ucx_transfer(descriptor: PayloadDescriptor) -> UcxTransfer:
-        descriptor.validate()
-        return UcxTransfer(
-            transfer_id=descriptor.transfer_id,
-            tag=transfer_tag(descriptor.transfer_id),
-            payload_bytes=descriptor.payload_bytes,
-            frame_sizes=descriptor.frame_sizes,
-        )
-
-    def _validate_peer_metadata(
-        self,
+    def _validate_metadata(
         endpoint: TransferEndpoint,
         token: ReceiveToken,
         descriptor: PayloadDescriptor,
     ) -> None:
         descriptor.validate()
-        if endpoint.transport != self.transport:
-            raise PayloadTransferError(f"UCX cannot use endpoint for {endpoint.transport!r}")
-        if token.data:
-            raise PayloadTransferError("UCX receive token must be empty")
-        if not isinstance(endpoint.data.get("address"), bytes):
-            raise PayloadTransferError("UCX endpoint address must be bytes")
+        if endpoint.transport != "nixl-ucx":
+            raise PayloadTransferError(f"NIXL cannot use endpoint for {endpoint.transport!r}")
+        if token.data.get("agent_name") != endpoint.data.get("agent_name"):
+            raise PayloadTransferError("NIXL endpoint and receive token agent names differ")
+        if not isinstance(token.data.get("frame_remote_descs"), bytes):
+            raise PayloadTransferError("NIXL receive token is missing frame descriptors")
+        if not isinstance(token.data.get("agent_metadata"), bytes):
+            raise PayloadTransferError("NIXL receive token is missing agent metadata")

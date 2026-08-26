@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Local UCX experiments and validation scripts
+tmp/
+
 # C extensions
 *.so
 

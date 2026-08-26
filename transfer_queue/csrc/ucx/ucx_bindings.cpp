@@ -62,16 +62,16 @@ class Request : public std::enable_shared_from_this<Request> {
  public:
   enum class Kind { kSend, kReceive };
 
-  Request(std::shared_ptr<Worker> worker, void* request, std::unique_ptr<uint8_t[]> buffer,
+  Request(std::shared_ptr<Worker> worker, void* request, py::object owner)
+      : worker_(std::move(worker)), request_(request), kind_(Kind::kSend), owner_(std::move(owner)) {}
+  Request(std::shared_ptr<Worker> worker, void* request, py::object owner, uint8_t* data,
           std::shared_ptr<ReceiveState> receive_state)
       : worker_(std::move(worker)),
         request_(request),
         kind_(Kind::kReceive),
-        buffer_(std::move(buffer)),
         receive_state_(std::move(receive_state)),
-        receive_data_(buffer_.get()) {}
-  Request(std::shared_ptr<Worker> worker, void* request, py::object owner)
-      : worker_(std::move(worker)), request_(request), kind_(Kind::kSend), owner_(std::move(owner)) {}
+        receive_data_(data),
+        owner_(std::move(owner)) {}
   ~Request();
 
   py::object wait(std::optional<double> timeout_seconds);
@@ -93,11 +93,6 @@ class Request : public std::enable_shared_from_this<Request> {
   std::shared_ptr<Worker> worker_;
   void* request_;
   Kind kind_;
-  // The receive target is overwritten completely by UCX.  Allocate it
-  // without value-initializing/zeroing every byte; zeroing an 8 MiB payload
-  // before each receive is pure CPU overhead and is not part of the wire
-  // transfer.  The Request owns this allocation until wait() returns.
-  std::unique_ptr<uint8_t[]> buffer_;
   std::shared_ptr<ReceiveState> receive_state_;
   uint8_t* receive_data_ = nullptr;
   // Keep the Python send buffer alive until UCX completes; no intermediate
@@ -188,8 +183,11 @@ class Worker : public std::enable_shared_from_this<Worker> {
     return std::make_shared<Endpoint>(shared_from_this(), endpoint);
   }
 
-  std::shared_ptr<Request> post_receive(uint64_t tag, size_t length) {
-    auto buffer = std::make_unique<uint8_t[]>(length);
+  std::shared_ptr<Request> post_receive_into(uint64_t tag, py::buffer target) {
+    py::buffer_info info = target.request();
+    if (info.ndim != 1 || info.itemsize != 1 || info.strides[0] != 1 || info.readonly) {
+      throw std::runtime_error("UCX receive target must be a writable contiguous byte buffer");
+    }
     auto receive_state = std::make_shared<ReceiveState>();
     ucp_request_param_t params{};
     params.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA |
@@ -200,9 +198,10 @@ class Worker : public std::enable_shared_from_this<Worker> {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       check_open();
-      request = ucp_tag_recv_nbx(worker_, buffer.get(), length, tag, UINT64_MAX, &params);
+      request = ucp_tag_recv_nbx(worker_, info.ptr, static_cast<size_t>(info.size), tag, UINT64_MAX, &params);
     }
-    return make_receive_request(request, std::move(buffer), std::move(receive_state), "ucp_tag_recv_nbx");
+    return make_receive_request(request, std::move(target), static_cast<uint8_t*>(info.ptr),
+                                std::move(receive_state), "ucp_tag_recv_nbx");
   }
 
   std::shared_ptr<Request> post_send(ucp_ep_h endpoint, uint64_t tag, py::buffer payload) {
@@ -307,11 +306,12 @@ class Worker : public std::enable_shared_from_this<Worker> {
   }
 
  private:
-  std::shared_ptr<Request> make_receive_request(void* request, std::unique_ptr<uint8_t[]> buffer,
+  std::shared_ptr<Request> make_receive_request(void* request, py::object owner, uint8_t* data,
                                                 std::shared_ptr<ReceiveState> receive_state,
                                                 const char* operation) {
     if (UCS_PTR_IS_ERR(request)) check(UCS_PTR_STATUS(request), operation);
-    return std::make_shared<Request>(shared_from_this(), request, std::move(buffer), std::move(receive_state));
+    return std::make_shared<Request>(shared_from_this(), request, std::move(owner), data,
+                                     std::move(receive_state));
   }
 
   std::shared_ptr<Request> make_send_request(void* request, py::object owner, const char* operation) {
@@ -461,7 +461,7 @@ PYBIND11_MODULE(_ucx, m) {
       .def(py::init<py::dict>(), py::arg("config") = py::dict())
       .def("address", &Worker::address)
       .def("connect", &Worker::connect)
-      .def("post_receive", &Worker::post_receive)
+      .def("post_receive_into", &Worker::post_receive_into)
       .def("progress", &Worker::progress)
       .def("close", &Worker::close);
   py::class_<Endpoint, std::shared_ptr<Endpoint>>(m, "Endpoint")

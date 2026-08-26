@@ -423,12 +423,12 @@ def decode(frames: list) -> Any:
 
 
 # Packed buffer layout:
-#     [item_count: uint32 LE]
-#     [N × (payload_offset: uint32 LE, payload_size: uint32 LE)]
+#     [item_count: uint64 LE]
+#     [N × (payload_offset: uint64 LE, payload_size: uint64 LE)]
 #     [payload_0 ... payload_{N-1}]
-_PACK_HEADER_FMT = "<I"
+_PACK_HEADER_FMT = "<Q"
 _PACK_HEADER_SIZE = struct.calcsize(_PACK_HEADER_FMT)
-_PACK_ENTRY_FMT = "<II"
+_PACK_ENTRY_FMT = "<QQ"
 _PACK_ENTRY_SIZE = struct.calcsize(_PACK_ENTRY_FMT)
 
 
@@ -476,19 +476,29 @@ def unpack_from(source_buffer: bytestr) -> list[memoryview]:
     return result
 
 
-def pack_frames(items: Sequence[bytestr]) -> bytearray:
-    """Pack codec frames into one contiguous mutable payload.
+def initialize_packed_frame_table(target_buffer: bytestr, frame_sizes: Sequence[int]) -> None:
+    """Write only the packed frame header/table into a receive buffer.
 
-    Returning the existing bytearray avoids an additional bytearray-to-bytes
-    copy. A payload transfer retains this buffer until the send completes.
+    The frame payload bytes are filled directly by a scatter/gather receive,
+    so this avoids copying them into a second contiguous buffer.
     """
-    payload = bytearray(calc_packed_size(items))
-    pack_into(payload, items)
-    return payload
+    target_mv = memoryview(target_buffer)
+    required = _PACK_HEADER_SIZE + len(frame_sizes) * _PACK_ENTRY_SIZE + sum(frame_sizes)
+    if target_mv.nbytes < required:
+        raise ValueError(f"frame table target has {target_mv.nbytes} bytes, requires {required}")
+    struct.pack_into(_PACK_HEADER_FMT, target_mv, 0, len(frame_sizes))
+    entry_offset = _PACK_HEADER_SIZE
+    payload_offset = required - sum(frame_sizes)
+    for size in frame_sizes:
+        if size < 0:
+            raise ValueError(f"negative frame size: {size}")
+        struct.pack_into(_PACK_ENTRY_FMT, target_mv, entry_offset, payload_offset, size)
+        entry_offset += _PACK_ENTRY_SIZE
+        payload_offset += size
 
 
 def unpack_frames(payload: bytes | bytearray | memoryview) -> list[memoryview]:
-    """Restore the exact codec frame layout from :func:`pack_frames`."""
+    """Restore the exact codec frame layout from a packed payload."""
     return unpack_from(payload)
 
 

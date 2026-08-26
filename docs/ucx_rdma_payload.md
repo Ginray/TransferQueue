@@ -49,7 +49,7 @@ matching the local operating system, architecture, and RDMA software stack.
 
 ```bash
 UCX_VERSION=1.22.0
-TQ_UCX_HOME=/opt/tq-ucx/${UCX_VERSION}
+TQ_UCX_HOME=/opt/tq-ucx/${UCX_VERSION}-mt
 UCX_PACKAGE=ucx-1.22.0-centos8-mofed5-cuda11-aarch64.tar.bz2
 UCX_RPM_DIR=/tmp/tq-ucx-rpms
 
@@ -77,6 +77,9 @@ sudo rpm -Uvh --replacepkgs --prefix="${TQ_UCX_HOME}" \
 
 ### Build from source
 
+If this UCX installation is used with NIXL's native progress thread, build the
+multi-thread variant shown below.
+
 Install the build dependencies:
 
 ```bash
@@ -92,8 +95,9 @@ git clone --depth 1 --branch v1.22.0 \
 cd /tmp/ucx-v1.22.0
 
 ./autogen.sh
-./contrib/configure-release \
-  --prefix=/opt/tq-ucx/1.22.0 \
+# 构建启用多线程支持的 UCX
+./contrib/configure-release-mt \
+  --prefix=/opt/tq-ucx/1.22.0-mt \
   --with-verbs \
   --with-rdmacm
 make -j"$(nproc)"
@@ -105,7 +109,7 @@ sudo make install
 Set the UCX tools, libraries, and TQ build paths:
 
 ```bash
-export TQ_UCX_HOME=/opt/tq-ucx/1.22.0
+export TQ_UCX_HOME=/opt/tq-ucx/1.22.0-mt
 export PATH="${TQ_UCX_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${TQ_UCX_HOME}/lib64:${TQ_UCX_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 ```
@@ -117,8 +121,10 @@ ucx_info -v
 ucx_info -d
 ```
 
-`ucx_info -v` should report v1.22.0. `ucx_info -d` should list an `rc_*` transport for the
-RDMA device. TCP or another auxiliary transport depends on the UCX and network environment.
+`ucx_info -v` should report v1.22.0 and include `--enable-mt` in the configure options.
+There is no separate runtime switch for UCX multi-thread support. `ucx_info -d` should list
+an `rc_*` transport for the RDMA device. TCP or another auxiliary transport depends on the
+UCX and network environment.
 
 You can also test cross-node UCX connectivity with `ucx_perftest`. On node A:
 

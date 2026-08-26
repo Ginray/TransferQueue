@@ -15,6 +15,8 @@
 
 import asyncio
 import os
+import statistics
+import time
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping
@@ -40,7 +42,7 @@ from transfer_queue.storage.payload_transfer import (
     normalize_payload_transfer,
 )
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.serial_utils import decode, encode, pack_frames, unpack_frames
+from transfer_queue.utils.serial_utils import calc_packed_size, decode, encode, unpack_frames
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -316,10 +318,16 @@ class AsyncSimpleStorageManager(StorageManager):
         # performed by ZMQMessage.serialize() and add an unnecessary full
         # payload pack/copy to every default PUT.
         if self.payload_transfer is not None:
-            frames = encode(storage_data)
-            payload = pack_frames(frames)
-            if len(payload) >= self.inline_threshold_bytes:
-                await self._put_via_payload_transfer(global_indexes, payload, target_storage_unit, data_parser, socket)
+            encode_start = time.perf_counter()
+            frames = tuple(encode(storage_data))
+            payload_bytes = calc_packed_size(frames)
+            self._record_payload_timing("put_encode_pack", encode_start)
+            if payload_bytes >= self.inline_threshold_bytes:
+                transfer_start = time.perf_counter()
+                await self._put_via_payload_transfer(
+                    global_indexes, frames, payload_bytes, target_storage_unit, data_parser, socket
+                )
+                self._record_payload_timing("put_payload_protocol", transfer_start)
                 return
 
         request_msg = ZMQMessage.create(
@@ -360,13 +368,14 @@ class AsyncSimpleStorageManager(StorageManager):
     async def _put_via_payload_transfer(
         self,
         global_indexes: list[int],
-        payload: bytes | bytearray | memoryview,
+        frames: tuple[bytes | bytearray | memoryview, ...],
+        payload_bytes: int,
         target_storage_unit: str,
         data_parser: Callable[[Any], Any] | None,
         socket: zmq.Socket,
     ) -> None:
         """PUT handshake: prepare receive -> payload send -> commit/store."""
-        descriptor = self._new_descriptor(len(payload))
+        descriptor = self._new_descriptor(payload_bytes, frames)
         # Once PREPARE is sent, the remote unit may have posted a receive even
         # if the control response is lost.  Keep cancellation enabled for all
         # subsequent failures, including a malformed/late READY response.
@@ -391,7 +400,9 @@ class AsyncSimpleStorageManager(StorageManager):
             token = ReceiveToken.from_dict(ready.body["receive_token"])
             endpoint = self._peer_endpoint(target_storage_unit)
             assert self.payload_transfer is not None
-            await asyncio.wrap_future(self.payload_transfer.send(endpoint, token, descriptor, payload))
+            send_start = time.perf_counter()
+            await asyncio.wrap_future(self.payload_transfer.send(endpoint, token, descriptor, frames))
+            self._record_payload_timing("put_data_plane_send", send_start)
             commit = ZMQMessage.create(
                 request_type=ZMQRequestType.PUT_DATA_COMMIT,
                 sender_id=self.storage_manager_id,
@@ -569,6 +580,7 @@ class AsyncSimpleStorageManager(StorageManager):
         transfer_id = uuid4().hex
         remote_prepared = False
         receive_prepared = False
+        descriptor = None
         prepare = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA_PREPARE,
             sender_id=self.storage_manager_id,
@@ -593,7 +605,9 @@ class AsyncSimpleStorageManager(StorageManager):
             if descriptor.transfer_id != transfer_id:
                 raise RuntimeError(f"GET descriptor identity changed by storage unit {target_storage_unit}")
             assert self.payload_transfer is not None
+            prepare_start = time.perf_counter()
             token = self.payload_transfer.prepare_receive(descriptor)
+            self._record_payload_timing("get_prepare_receive", prepare_start)
             receive_prepared = True
             commit = ZMQMessage.create(
                 request_type=ZMQRequestType.GET_DATA_COMMIT,
@@ -605,29 +619,33 @@ class AsyncSimpleStorageManager(StorageManager):
                     "receive_token": token.to_dict(),
                 },
             )
+            control_start = time.perf_counter()
             await socket.send_multipart(commit.serialize(), copy=False)
-            # GET_DATA_RESPONSE acknowledges that the StorageUnit accepted the
-            # commit and retired its pending protocol entry; data completion is
-            # represented by the local receive Future. Wait for both so neither
-            # control nor data-plane completion is left unobserved.
-            receive_future = self.payload_transfer.receive(descriptor)
-            receive_task = asyncio.wrap_future(receive_future)
             try:
                 response = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
                 self._expect(response, ZMQRequestType.GET_DATA_RESPONSE, target_storage_unit)
                 remote_prepared = False
-                payload = await receive_task
+                self._record_payload_timing("get_commit_response", control_start)
+                # The storage unit sends GET_DATA_RESPONSE only after its
+                # payload send has completed.  Start/finish the local receive
+                # after that acknowledgement so transports that release their
+                # registration in ``receive`` (NIXL) cannot deregister the
+                # destination before the remote write finishes.
+                receive_start = time.perf_counter()
+                payload = await asyncio.wrap_future(self.payload_transfer.receive(descriptor))
+                self._record_payload_timing("get_receive_complete", receive_start)
             except BaseException:
-                if not receive_task.done():
-                    receive_task.cancel()
-                await asyncio.gather(receive_task, return_exceptions=True)
                 raise
+            decode_start = time.perf_counter()
             frames = unpack_frames(payload)
             result = decode(frames)
+            self.payload_transfer.release_receive(descriptor.transfer_id)
+            self._record_payload_timing("get_unpack_decode", decode_start)
             return fields, result
         except BaseException:
             if receive_prepared:
                 self.payload_transfer.cancel_receive(descriptor.transfer_id)
+                self.payload_transfer.release_receive(descriptor.transfer_id)
             if remote_prepared:
                 await self._cancel_payload_get(transfer_id, target_storage_unit)
             raise
@@ -684,10 +702,15 @@ class AsyncSimpleStorageManager(StorageManager):
             cancel_socket.close(linger=0)
             context.term()
 
-    def _new_descriptor(self, payload_bytes: int) -> PayloadDescriptor:
+    def _new_descriptor(
+        self,
+        payload_bytes: int,
+        frames: tuple[bytes | bytearray | memoryview, ...] | None = None,
+    ) -> PayloadDescriptor:
         return PayloadDescriptor(
             transfer_id=uuid4().hex,
             payload_bytes=payload_bytes,
+            frame_sizes=tuple(memoryview(frame).nbytes for frame in frames) if frames is not None else (),
         )
 
     def _peer_endpoint(self, storage_unit_id: str) -> TransferEndpoint:
@@ -875,6 +898,32 @@ class AsyncSimpleStorageManager(StorageManager):
         await asyncio.gather(*tasks)
 
         logger.info(f"[{self.storage_manager_id}]: restored {len(su_ids)} storage units from {su_dir}")
+
+    def reset_payload_timing(self) -> None:
+        """Reset optional payload phase samples."""
+        if getattr(self, "_payload_timing_enabled", False):
+            self._payload_timings.clear()
+
+    def get_payload_timing(self) -> dict[str, dict[str, Any]]:
+        """Return optional manager-side payload phase samples."""
+        if not getattr(self, "_payload_timing_enabled", False):
+            return {}
+        return {
+            name: {
+                "samples_seconds": list(samples),
+                "median_seconds": statistics.median(samples),
+                "p95_seconds": (
+                    samples[0]
+                    if len(samples) == 1
+                    else statistics.quantiles(samples, n=100, method="inclusive")[94]
+                ),
+            }
+            for name, samples in self._payload_timings.items()
+        }
+
+    def _record_payload_timing(self, name: str, start: float) -> None:
+        if getattr(self, "_payload_timing_enabled", False):
+            self._payload_timings.setdefault(name, []).append(time.perf_counter() - start)
 
     def close(self) -> None:
         """Close payload transfer resources before ZMQ ownership is released."""

@@ -15,6 +15,7 @@
 
 import os
 import pickle
+import statistics
 import time
 import weakref
 from dataclasses import dataclass
@@ -37,7 +38,7 @@ from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
-from transfer_queue.utils.serial_utils import decode, encode, pack_frames, unpack_frames
+from transfer_queue.utils.serial_utils import calc_packed_size, decode, encode, unpack_frames
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -56,7 +57,6 @@ logger = get_logger(__name__)
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))  # in seconds
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 _MAX_PENDING_PAYLOAD_TRANSFERS = 64
-_MAX_PENDING_PAYLOAD_BYTES = 2**32 - 1
 _PENDING_PAYLOAD_TTL_SECONDS = 300
 
 
@@ -73,7 +73,7 @@ class _PendingPut:
 class _PendingGet:
     descriptor: PayloadDescriptor
     sender_id: str
-    payload: bytearray
+    frames: tuple[bytes | bytearray | memoryview, ...]
     created_at: float
 
 
@@ -193,8 +193,8 @@ class SimpleStorageUnit:
         Args:
             storage_unit_size: Maximum number of elements that can be stored in this storage unit.
                 If None, the storage unit has unlimited capacity.
-            payload_transfer: ``zmq`` keeps the existing path; ``ucx`` enables
-                the optional payload data plane.
+            payload_transfer: ``zmq`` keeps the existing path; ``ucx`` and
+                ``nixl-ucx`` enable optional RDMA payload data planes.
         """
         self.storage_unit_id = f"TQ_STORAGE_UNIT_{uuid4().hex[:8]}"
         self.storage_unit_size = storage_unit_size
@@ -208,6 +208,8 @@ class SimpleStorageUnit:
         # completion. Keep only the protocol state needed by GET_COMMIT here,
         # avoiding a second large-payload reference while the request is live.
         self._pending_gets: dict[str, _PendingGet] = {}
+        self._payload_timing_enabled = os.environ.get("TQ_PAYLOAD_TIMING") == "1"
+        self._payload_timings: dict[str, list[float]] = {}
 
         # Internal communication address for proxy and workers
         self._inproc_addr = f"inproc://simple_storage_workers_{self.storage_unit_id}"
@@ -487,11 +489,13 @@ class SimpleStorageUnit:
         try:
             descriptor = PayloadDescriptor.from_dict(data_parts.body["descriptor"])
             self._expire_pending_payloads()
-            self._check_pending_payload_capacity(descriptor.payload_bytes)
+            self._check_pending_payload_capacity()
             if descriptor.transfer_id in self._pending_puts:
                 raise RuntimeError(f"duplicate PUT transfer_id: {descriptor.transfer_id}")
             global_indexes = tuple(data_parts.body["global_indexes"])
+            prepare_start = time.perf_counter()
             token = self.payload_transfer.prepare_receive(descriptor)
+            self._record_payload_timing("put_prepare_receive", prepare_start)
             receive_prepared = True
             self._pending_puts[descriptor.transfer_id] = _PendingPut(
                 descriptor=descriptor,
@@ -523,12 +527,17 @@ class SimpleStorageUnit:
                 raise RuntimeError(f"PUT transfer {transfer_id} belongs to another sender")
             self._pending_puts.pop(transfer_id)
             owns_receive = True
+            receive_start = time.perf_counter()
             payload = self.payload_transfer.receive(pending.descriptor).result() if self.payload_transfer else None
+            self._record_payload_timing("put_receive_wait", receive_start)
             if payload is None:
                 raise RuntimeError("payload transfer is unavailable")
+            decode_start = time.perf_counter()
             frames = unpack_frames(payload)
             field_data = decode(frames)
             self._put_decoded_data(list(pending.global_indexes), field_data, pending.data_parser)
+            self.payload_transfer.release_receive(transfer_id)
+            self._record_payload_timing("put_unpack_decode_store", decode_start)
             return ZMQMessage.create(
                 request_type=ZMQRequestType.PUT_DATA_RESPONSE,
                 sender_id=self.storage_unit_id,
@@ -537,6 +546,7 @@ class SimpleStorageUnit:
         except Exception as e:
             if owns_receive and self.payload_transfer is not None:
                 self.payload_transfer.cancel_receive(transfer_id)
+                self.payload_transfer.release_receive(transfer_id)
             return self._payload_transfer_error(f"PUT commit failed: {e}")
 
     def _handle_put_cancel(self, data_parts: ZMQMessage) -> ZMQMessage:
@@ -574,12 +584,10 @@ class SimpleStorageUnit:
             if pending.created_at < deadline:
                 self._pending_gets.pop(transfer_id)
 
-    def _check_pending_payload_capacity(self, payload_bytes: int) -> None:
+    def _check_pending_payload_capacity(self) -> None:
         pending = [*self._pending_puts.values(), *self._pending_gets.values()]
         if len(pending) >= _MAX_PENDING_PAYLOAD_TRANSFERS:
             raise RuntimeError("too many pending payload transfers")
-        if sum(item.descriptor.payload_bytes for item in pending) + payload_bytes > _MAX_PENDING_PAYLOAD_BYTES:
-            raise RuntimeError("pending payload byte limit exceeded")
 
     def _handle_get_prepare(self, data_parts: ZMQMessage) -> ZMQMessage:
         """Encode GET data and retain it until the requester posts its receive."""
@@ -594,10 +602,14 @@ class SimpleStorageUnit:
             global_indexes = data_parts.body["global_indexes"]
             # StorageUnitData.get_data() gathers existing Python references; it
             # does not perform tensor aggregation or mutate PyTorch settings.
+            lookup_start = time.perf_counter()
             result_data = self.storage_data.get_data(fields, global_indexes)
-            encoded_frames = encode(result_data)
-            payload = pack_frames(encoded_frames)
-            if len(payload) < self.inline_threshold_bytes:
+            self._record_payload_timing("get_storage_lookup", lookup_start)
+            encode_start = time.perf_counter()
+            encoded_frames = tuple(encode(result_data))
+            payload_bytes = calc_packed_size(encoded_frames)
+            self._record_payload_timing("get_encode_pack", encode_start)
+            if payload_bytes < self.inline_threshold_bytes:
                 return ZMQMessage.create(
                     request_type=ZMQRequestType.GET_DATA_READY,
                     sender_id=self.storage_unit_id,
@@ -605,15 +617,16 @@ class SimpleStorageUnit:
                 )
             descriptor = PayloadDescriptor(
                 transfer_id=transfer_id,
-                payload_bytes=len(payload),
+                payload_bytes=payload_bytes,
+                frame_sizes=tuple(memoryview(frame).nbytes for frame in encoded_frames),
             )
             descriptor.validate()
             self._expire_pending_payloads()
-            self._check_pending_payload_capacity(descriptor.payload_bytes)
+            self._check_pending_payload_capacity()
             self._pending_gets[descriptor.transfer_id] = _PendingGet(
                 descriptor=descriptor,
                 sender_id=data_parts.sender_id,
-                payload=payload,
+                frames=encoded_frames,
                 created_at=time.monotonic(),
             )
             return ZMQMessage.create(
@@ -642,7 +655,9 @@ class SimpleStorageUnit:
             # wait forever on its receive future with no control-plane error.
             endpoint = TransferEndpoint.from_dict(data_parts.body["receiver_endpoint"])
             token = ReceiveToken.from_dict(data_parts.body["receive_token"])
-            self.payload_transfer.send(endpoint, token, pending.descriptor, pending.payload).result()
+            send_start = time.perf_counter()
+            self.payload_transfer.send(endpoint, token, pending.descriptor, pending.frames).result()
+            self._record_payload_timing("get_payload_send", send_start)
             return ZMQMessage.create(
                 request_type=ZMQRequestType.GET_DATA_RESPONSE,
                 sender_id=self.storage_unit_id,
@@ -664,9 +679,7 @@ class SimpleStorageUnit:
             body={"transfer_id": transfer_id},
         )
 
-    def _put_decoded_data(
-        self, global_indexes: list[int], field_data: dict[str, Any], data_parser: Any
-    ) -> None:
+    def _put_decoded_data(self, global_indexes: list[int], field_data: dict[str, Any], data_parser: Any) -> None:
         """Validate parsed data and store it."""
         if data_parser is not None:
             if not callable(data_parser):
@@ -981,3 +994,29 @@ class SimpleStorageUnit:
             "id": self.storage_unit_id,
             "endpoint": self.payload_transfer.endpoint().to_dict(),
         }
+
+    def reset_payload_timing(self) -> None:
+        """Reset optional payload phase samples."""
+        if self._payload_timing_enabled:
+            self._payload_timings.clear()
+
+    def get_payload_timing(self) -> dict[str, dict[str, Any]]:
+        """Return optional payload phase samples and summary statistics."""
+        if not self._payload_timing_enabled:
+            return {}
+        return {
+            name: {
+                "samples_seconds": list(samples),
+                "median_seconds": statistics.median(samples),
+                "p95_seconds": (
+                    samples[0]
+                    if len(samples) == 1
+                    else statistics.quantiles(samples, n=100, method="inclusive")[94]
+                ),
+            }
+            for name, samples in self._payload_timings.items()
+        }
+
+    def _record_payload_timing(self, name: str, start: float) -> None:
+        if self._payload_timing_enabled:
+            self._payload_timings.setdefault(name, []).append(time.perf_counter() - start)

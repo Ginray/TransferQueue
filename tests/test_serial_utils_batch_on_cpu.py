@@ -44,6 +44,15 @@ def test_calc_packed_size_then_pack_unpack_roundtrip():
     assert [bytes(mv) for mv in recovered] == items
 
 
+def test_initialize_packed_frame_table_leaves_payload_for_direct_receive():
+    items = [b"hello", b"world!"]
+    buf = bytearray(serial_utils.calc_packed_size(items))
+    serial_utils.initialize_packed_frame_table(buf, [len(item) for item in items])
+    payload_start = serial_utils._PACK_HEADER_SIZE + len(items) * serial_utils._PACK_ENTRY_SIZE
+    buf[payload_start:] = b"helloworld!"
+    assert [bytes(mv) for mv in serial_utils.unpack_from(buf)] == items
+
+
 def test_pack_into_writes_only_within_its_slice():
     items = [b"alpha", b"beta", b"gamma"]
     sz = serial_utils.calc_packed_size(items)
@@ -72,7 +81,7 @@ def test_unpack_from_rejects_invalid_frame_bounds():
     serial_utils.pack_into(buf, items)
 
     # Corrupt the frame offset so it points into the frame table.
-    struct.pack_into("<Q", buf, 4, 4)
+    struct.pack_into("<Q", buf, serial_utils._PACK_HEADER_SIZE, 4)
     with pytest.raises(ValueError, match="outside the payload"):
         serial_utils.unpack_from(buf)
 

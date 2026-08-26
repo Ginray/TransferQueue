@@ -35,6 +35,10 @@ class PayloadDescriptor:
 
     transfer_id: str
     payload_bytes: int
+    # When present, the payload is the packed representation of these frames.
+    # The descriptor keeps the packed size for the existing wire contract,
+    # while transports that support scatter/gather may send the frames directly.
+    frame_sizes: tuple[int, ...] = ()
 
     @staticmethod
     def validate_transfer_id(transfer_id: str) -> None:
@@ -45,18 +49,31 @@ class PayloadDescriptor:
         self.validate_transfer_id(self.transfer_id)
         if self.payload_bytes < 0:
             raise PayloadTransferError(f"negative payload length for {self.transfer_id}")
+        if any(size < 0 for size in self.frame_sizes):
+            raise PayloadTransferError(f"negative frame length for {self.transfer_id}")
+        if self.frame_sizes:
+            packed_size = 8 + 16 * len(self.frame_sizes) + sum(self.frame_sizes)
+            if packed_size != self.payload_bytes:
+                raise PayloadTransferError(
+                    f"packed payload length mismatch for {self.transfer_id}: "
+                    f"expected {packed_size}, got {self.payload_bytes}"
+                )
 
-    def to_dict(self) -> dict[str, int | str]:
-        return {
+    def to_dict(self) -> dict[str, int | str | list[int]]:
+        result: dict[str, int | str | list[int]] = {
             "transfer_id": self.transfer_id,
             "payload_bytes": self.payload_bytes,
         }
+        if self.frame_sizes:
+            result["frame_sizes"] = list(self.frame_sizes)
+        return result
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> PayloadDescriptor:
         descriptor = cls(
             transfer_id=str(value["transfer_id"]),
             payload_bytes=int(value["payload_bytes"]),
+            frame_sizes=tuple(int(size) for size in value.get("frame_sizes", ())),
         )
         descriptor.validate()
         return descriptor
@@ -110,9 +127,9 @@ class PayloadTransfer(ABC):
         endpoint: TransferEndpoint,
         token: ReceiveToken,
         descriptor: PayloadDescriptor,
-        payload: bytes | bytearray | memoryview,
+        frames: list[bytes | bytearray | memoryview] | tuple[bytes | bytearray | memoryview, ...],
     ) -> Future[None]:
-        """Start sending a payload and return its completion future."""
+        """Send encoded frames directly using the provider data path."""
 
     @abstractmethod
     def receive(self, descriptor: PayloadDescriptor) -> Future[memoryview]:
@@ -121,6 +138,10 @@ class PayloadTransfer(ABC):
     @abstractmethod
     def cancel_receive(self, transfer_id: str) -> None:
         """Start best-effort cancellation of a prepared receive."""
+
+    def release_receive(self, transfer_id: str) -> None:
+        """Release transport-owned receive storage after the caller consumed it."""
+        return None
 
     @property
     @abstractmethod

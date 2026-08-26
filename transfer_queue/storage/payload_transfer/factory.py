@@ -17,14 +17,17 @@
 
 from transfer_queue.storage.payload_transfer.base import PayloadTransfer
 
-_SUPPORTED_TRANSFERS = frozenset({"zmq", "ucx"})
+_SUPPORTED_TRANSFERS = frozenset({"nixl-ucx", "ucx", "zmq"})
 
 
 def normalize_payload_transfer(value: object = "zmq") -> str:
     """Return a validated SimpleStorage payload transfer name."""
     normalized = str(value).strip().lower()
     if normalized not in _SUPPORTED_TRANSFERS:
-        raise ValueError(f"unsupported SimpleStorage payload transfer: {normalized!r}; expected 'zmq' or 'ucx'")
+        raise ValueError(
+            f"unsupported SimpleStorage payload transfer: {normalized!r}; "
+            "expected 'zmq', 'ucx' or 'nixl-ucx'"
+        )
     return normalized
 
 
@@ -33,7 +36,13 @@ def create_payload_transfer(value: object = "zmq", local_ip: str | None = None) 
     normalized = normalize_payload_transfer(value)
     if normalized == "zmq":
         return None
+    if normalized == "nixl-ucx":
+        from transfer_queue.storage.payload_transfer.nixl import NixlPayloadTransfer
 
-    from transfer_queue.storage.payload_transfer.ucx import UcxPayloadTransfer
+        return NixlPayloadTransfer(local_ip=local_ip)
+    if normalized == "ucx":
+        from transfer_queue.storage.payload_transfer.ucx import UcxPayloadTransfer
 
-    return UcxPayloadTransfer(local_ip=local_ip)
+        return UcxPayloadTransfer(local_ip=local_ip)
+
+    raise RuntimeError(f"unhandled SimpleStorage payload transfer: {normalized!r}")

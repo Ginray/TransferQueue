@@ -194,6 +194,13 @@ def _find_ucx_info() -> Path | None:
         path = Path(configured)
         return path if path.is_file() and os.access(path, os.X_OK) else None
 
+    for prefix_name in ("TQ_UCX_HOME", "UCX_HOME"):
+        prefix = os.environ.get(prefix_name)
+        if prefix:
+            path = Path(prefix) / "bin" / "ucx_info"
+            if path.is_file() and os.access(path, os.X_OK):
+                return path
+
     # Prefer the UCX runtime loaded by the native extension.  A system
     # ``ucx_info`` in PATH may describe a different UCX installation.
     try:

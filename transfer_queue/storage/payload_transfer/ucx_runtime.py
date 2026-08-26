@@ -27,14 +27,20 @@ from concurrent.futures import CancelledError, Future
 from dataclasses import dataclass
 from queue import Empty, Queue
 from threading import Event, Thread
-from time import perf_counter, sleep
+from time import perf_counter
 from typing import Any, Callable, Literal
 
 from transfer_queue.storage.payload_transfer.base import PayloadTransferError
-from transfer_queue.storage.payload_transfer.ucx_discovery import discover_ucx_device
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.serial_utils import initialize_packed_frame_table
 
 logger = get_logger(__name__)
+
+# Device discovery is optional for callers that provide an already configured
+# ``UcxRuntime``.  Keep a patchable module attribute for tests and load the
+# implementation only when the factory is used.
+discover_ucx_device = None
+
 
 DEFAULT_TRANSFER_TIMEOUT_SECONDS = float(os.environ.get("TQ_UCX_TRANSFER_TIMEOUT_SECONDS", "200"))
 DEFAULT_ENDPOINT_TIMEOUT_SECONDS = 30.0
@@ -87,6 +93,40 @@ class _ActiveRequest:
     deadline: float | None
 
 
+class _CompositeRequest:
+    """Poll a group of UCX requests as one logical payload transfer."""
+
+    def __init__(self, requests: list[Any], result: Any = None):
+        self._requests = requests
+        self._result = result
+
+    def test(self) -> Any:
+        for request in self._requests:
+            if request.test() is None:
+                return None
+        return self._result
+
+    def start_cancel(self) -> None:
+        for request in self._requests:
+            request.start_cancel()
+
+    def test_cancel(self) -> Any:
+        pending = False
+        for request in self._requests:
+            if request.test_cancel() is None:
+                pending = True
+        return None if pending else True
+
+    def wait(self, timeout_seconds: float | None) -> Any:
+        for request in self._requests:
+            request.wait(timeout_seconds)
+        return self._result
+
+    def cancel(self) -> None:
+        for request in self._requests:
+            request.cancel()
+
+
 class _UcxOwnerThread:
     """Own one UCP worker and progress all active requests on one thread."""
 
@@ -96,7 +136,6 @@ class _UcxOwnerThread:
         self._canceling: list[Any] = []
         self._cancel_waiters: list[Future[None]] = []
         self._progress_callback = progress
-        self._progress_sleep_seconds = 50 / 1_000_000
         self._ready = Event()
         self._init_error: BaseException | None = None
         self._thread = Thread(target=self._run, args=(initialize,), name="tq-ucx-owner", daemon=True)
@@ -183,8 +222,6 @@ class _UcxOwnerThread:
                         self._start_cancel(active.request)
                         active.future.set_exception(exc)
                 self._active = remaining
-                if self._active and self._progress_sleep_seconds:
-                    sleep(self._progress_sleep_seconds)
             if self._canceling:
                 canceling = []
                 for request in self._canceling:
@@ -201,8 +238,6 @@ class _UcxOwnerThread:
                     for waiter in waiters:
                         if not waiter.done():
                             waiter.set_result(None)
-                elif not self._active and self._progress_sleep_seconds:
-                    sleep(self._progress_sleep_seconds)
 
     def _start_cancel(self, request: Any) -> None:
         """Begin native cancellation and retain the request until terminal."""
@@ -281,6 +316,7 @@ class UcxTransfer:
     transfer_id: str
     tag: int
     payload_bytes: int
+    frame_sizes: tuple[int, ...] = ()
 
     def validate_identity(self) -> None:
         """Validate fields that identify a transfer before its size is known."""
@@ -295,11 +331,26 @@ class UcxTransfer:
         self.validate_identity()
         if self.payload_bytes < 0:
             raise UcxError(f"negative payload length for {self.transfer_id}")
+        if any(size < 0 for size in self.frame_sizes):
+            raise UcxError(f"negative frame length for {self.transfer_id}")
+        if self.frame_sizes:
+            packed_size = 8 + 16 * len(self.frame_sizes) + sum(self.frame_sizes)
+            if packed_size != self.payload_bytes:
+                raise UcxError(
+                    f"packed payload length mismatch for {self.transfer_id}: "
+                    f"expected {packed_size}, got {self.payload_bytes}"
+                )
 
 
 def transfer_tag(transfer_id: str) -> int:
     """Derive a stable positive 63-bit UCX tag from a UUID-like transfer id."""
     digest = hashlib.blake2b(transfer_id.encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big") & ((1 << 63) - 1)
+
+
+def frame_tag(transfer_id: str, frame_index: int) -> int:
+    """Derive a tag for one frame of a direct UCX transfer."""
+    digest = hashlib.blake2b(f"{transfer_id}:{frame_index}".encode(), digest_size=8).digest()
     return int.from_bytes(digest, "big") & ((1 << 63) - 1)
 
 
@@ -332,6 +383,8 @@ class UcxRuntime:
         self._owner = _UcxOwnerThread(self._init_worker, lambda: self._worker.progress())
         self._endpoints: dict[bytes, Any] = {}
         self._receives: dict[str, Any] = {}
+        self._receive_buffers: dict[str, tuple[tuple[int, ...], bytearray]] = {}
+        self._reusable_receive_buffer: tuple[tuple[int, ...], bytearray] | None = None
         self._closed = False
 
     def _init_worker(self) -> None:
@@ -340,6 +393,8 @@ class UcxRuntime:
         except ImportError as exc:  # pragma: no cover - depends on optional native build
             raise UcxError("the installed TransferQueue package does not include UCX support") from exc
         self._worker = _ucx.Worker(self._ucx_config)
+        if not hasattr(self._worker, "post_receive_into"):
+            raise UcxError("UCX direct-frame support is required")
         # A worker address is immutable for the lifetime of its worker. Cache
         # it once on the owner thread instead of enqueueing a native call for
         # every GET request and bootstrap read.
@@ -358,12 +413,37 @@ class UcxRuntime:
 
     def prepare_receive(self, descriptor: UcxTransfer) -> None:
         self._validate_descriptor(descriptor)
+        if not descriptor.frame_sizes:
+            raise UcxError("UCX direct-frame receive requires frame sizes")
 
         def operation() -> None:
             if descriptor.transfer_id in self._receives:
                 raise UcxError(f"duplicate receive preparation: {descriptor.transfer_id}")
-            request = self._worker.post_receive(descriptor.tag, descriptor.payload_bytes)
-            self._receives[descriptor.transfer_id] = request
+            reusable = self._reusable_receive_buffer
+            if reusable is not None and reusable[0] == descriptor.frame_sizes:
+                buffer = reusable[1]
+                self._reusable_receive_buffer = None
+            else:
+                # UCX overwrites every frame region. A matching buffer can be
+                # returned by release_receive() and reused on the next round.
+                buffer = bytearray(descriptor.payload_bytes)
+            initialize_packed_frame_table(buffer, descriptor.frame_sizes)
+            payload_offset = 8 + 16 * len(descriptor.frame_sizes)
+            requests = []
+            try:
+                for index, size in enumerate(descriptor.frame_sizes):
+                    target = memoryview(buffer)[payload_offset : payload_offset + size]
+                    if size:
+                        requests.append(
+                            self._worker.post_receive_into(frame_tag(descriptor.transfer_id, index), target)
+                        )
+                    payload_offset += size
+            except BaseException:
+                for request in requests:
+                    request.cancel()
+                raise
+            self._receives[descriptor.transfer_id] = _CompositeRequest(requests, buffer)
+            self._receive_buffers[descriptor.transfer_id] = (descriptor.frame_sizes, buffer)
 
         self._call(operation)
 
@@ -371,37 +451,23 @@ class UcxRuntime:
         self,
         peer_address: bytes,
         descriptor: UcxTransfer,
-        payload: bytes | bytearray | memoryview,
-        peer_address_digest: str | None = None,
-    ) -> None:
-        self._validate_send(peer_address, descriptor, len(payload), peer_address_digest)
-
-        def operation() -> None:
-            request = self._post_send(peer_address, peer_address_digest, descriptor, payload)
-            request.wait(self._timeout_seconds)
-
-        self._call(operation)
-
-    def send_async(
-        self,
-        peer_address: bytes,
-        descriptor: UcxTransfer,
-        payload: bytes | bytearray | memoryview,
+        frames: tuple[bytes | bytearray | memoryview, ...],
         peer_address_digest: str | None = None,
     ) -> Future[None]:
-        """Start a send without blocking the caller's control-plane handler.
-
-        The future owns the payload through the submitted operation. UCX
-        posting, progress, completion polling, and endpoint access all remain
-        on the single owner thread; multiple requests can be in flight without
-        serializing on one blocking ``Request.wait()``.
-        """
+        """Send encoded frames without first concatenating them."""
         if self._closed:
             raise UcxError("UCX data plane is closed")
-        self._validate_send(peer_address, descriptor, len(payload), peer_address_digest)
+        self._validate_descriptor(descriptor)
+        if not descriptor.frame_sizes:
+            raise UcxError("UCX frame send requires frame sizes in the descriptor")
+        if tuple(memoryview(frame).nbytes for frame in frames) != descriptor.frame_sizes:
+            raise UcxError(f"frame lengths do not match payload descriptor for {descriptor.transfer_id}")
+        if self._require_address_digest and peer_address_digest is None:
+            raise UcxError("UCX worker address digest is required")
+        self._validate_peer_address(peer_address, peer_address_digest)
 
         def operation() -> Any:
-            return self._post_send(peer_address, peer_address_digest, descriptor, payload)
+            return self._post_send(peer_address, peer_address_digest, descriptor, frames)
 
         future = self._owner.submit_request(
             operation,
@@ -454,7 +520,9 @@ class UcxRuntime:
         def complete(payload: Any) -> memoryview:
             return self._received_payload(descriptor, payload)
 
-        return self._owner.submit_request(operation, lambda request: request.test(), complete, self._timeout_seconds)
+        return self._owner.submit_request(
+            operation, lambda request: request.test(), complete, self._timeout_seconds
+        )
 
     def cancel_receive(self, transfer_id: str) -> Future[None]:
         """Start canceling a posted receive without blocking the control plane."""
@@ -464,6 +532,7 @@ class UcxRuntime:
         def operation() -> Any:
             request = self._receives.pop(transfer_id, None)
             if request is not None:
+                self._receive_buffers.pop(transfer_id, None)
                 request.start_cancel()
             return request
 
@@ -488,6 +557,21 @@ class UcxRuntime:
         future.add_done_callback(report_cancel_failure)
         return future
 
+    def release_receive(self, transfer_id: str) -> None:
+        """Return a completed direct receive buffer for the next same-size transfer."""
+        if self._closed:
+            return
+
+        def operation() -> None:
+            # Never recycle a buffer while UCX can still write into it.
+            if transfer_id in self._receives:
+                return
+            buffer_info = self._receive_buffers.pop(transfer_id, None)
+            if buffer_info is not None:
+                self._reusable_receive_buffer = buffer_info
+
+        self._call(operation)
+
     @property
     def pending_receive_count(self) -> int:
         """Return the number of posted, not-yet-finished receives."""
@@ -504,6 +588,8 @@ class UcxRuntime:
             for transfer_id in list(self._receives):
                 request = self._receives.pop(transfer_id)
                 request.cancel()
+            self._receive_buffers.clear()
+            self._reusable_receive_buffer = None
             for endpoint in self._endpoints.values():
                 endpoint.close(DEFAULT_ENDPOINT_TIMEOUT_SECONDS)
             self._endpoints.clear()
@@ -519,23 +605,6 @@ class UcxRuntime:
         finally:
             self._owner.stop()
 
-    def _validate_send(
-        self,
-        peer_address: bytes,
-        descriptor: UcxTransfer,
-        payload_bytes: int,
-        peer_address_digest: str | None,
-    ) -> None:
-        self._validate_descriptor(descriptor)
-        if payload_bytes != descriptor.payload_bytes:
-            raise UcxError(
-                f"payload length mismatch for {descriptor.transfer_id}: "
-                f"expected {descriptor.payload_bytes}, got {payload_bytes}"
-            )
-        if self._require_address_digest and peer_address_digest is None:
-            raise UcxError("UCX worker address digest is required")
-        self._validate_peer_address(peer_address, peer_address_digest)
-
     def _validate_descriptor(self, descriptor: UcxTransfer) -> None:
         descriptor.validate()
 
@@ -544,10 +613,15 @@ class UcxRuntime:
         peer_address: bytes,
         peer_address_digest: str | None,
         descriptor: UcxTransfer,
-        payload: bytes | bytearray | memoryview,
-    ) -> Any:
+        frames: tuple[bytes | bytearray | memoryview, ...],
+    ) -> _CompositeRequest:
         endpoint = self._endpoint(peer_address, peer_address_digest)
-        return endpoint.post_send(descriptor.tag, memoryview(payload))
+        requests = [
+            endpoint.post_send(frame_tag(descriptor.transfer_id, index), memoryview(frame))
+            for index, frame in enumerate(frames)
+            if memoryview(frame).nbytes
+        ]
+        return _CompositeRequest(requests, True)
 
     @staticmethod
     def _received_payload(descriptor: UcxTransfer, received: Any) -> memoryview:
@@ -582,6 +656,12 @@ class UcxRuntime:
 
 def create_ucx_runtime(local_ip: str | None = None) -> UcxRuntime:
     """Create the strict UCX/RDMA data plane for one local endpoint."""
+    global discover_ucx_device
+    if discover_ucx_device is None:
+        from transfer_queue.storage.payload_transfer.ucx_discovery import discover_ucx_device as discover
+
+        discover_ucx_device = discover
+
     selection = discover_ucx_device(local_ip)
     if selection.rdma_device is None:
         raise UcxError(f"no RoCE-v2 device and GID match local IP {local_ip or 'unknown'}")
