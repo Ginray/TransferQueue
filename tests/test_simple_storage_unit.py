@@ -21,6 +21,7 @@ import tensordict
 import torch
 import zmq
 
+from transfer_queue.storage.payload_transfer import ReceiveToken
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
@@ -85,6 +86,43 @@ class MockStorageClient:
     def close(self):
         self.socket.close()
         self.context.term()
+
+
+def test_put_prepare_cancels_receive_when_pending_state_cannot_be_saved():
+    class FailingPendingPuts(dict):
+        def __setitem__(self, key, value):
+            raise RuntimeError("cannot save pending state")
+
+    class Transfer:
+        def __init__(self):
+            self.cancelled = []
+
+        def prepare_receive(self, descriptor):
+            return ReceiveToken(data={"tag": 1})
+
+        def cancel_receive(self, transfer_id):
+            self.cancelled.append(transfer_id)
+
+    storage_class = SimpleStorageUnit.__ray_metadata__.modified_class
+    storage = object.__new__(storage_class)
+    storage.storage_unit_id = "storage"
+    storage.payload_transfer = Transfer()
+    storage._pending_puts = FailingPendingPuts()
+    storage._pending_gets = {}
+    request = ZMQMessage.create(
+        request_type=ZMQRequestType.PUT_DATA_PREPARE,
+        sender_id="manager",
+        body={
+            "global_indexes": [1],
+            "descriptor": {"transfer_id": "transfer", "payload_bytes": 8},
+            "data_parser": None,
+        },
+    )
+
+    response = storage._handle_put_prepare(request)
+
+    assert response.request_type == ZMQRequestType.PUT_GET_ERROR
+    assert storage.payload_transfer.cancelled == ["transfer"]
 
 
 @pytest.fixture(scope="session")
