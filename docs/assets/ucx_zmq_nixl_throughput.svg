@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="940" viewBox="0 0 1100 940">
+  <style>
+    .title { font: 700 20px sans-serif; fill: #222; }
+    .axis { font: 12px sans-serif; fill: #555; }
+    .label { font: 700 13px sans-serif; }
+    .grid { stroke: #e5e7eb; stroke-width: 1; }
+    .axis-line { stroke: #6b7280; stroke-width: 1.2; }
+    .zmq { stroke: #2563eb; fill: #2563eb; }
+    .ucx { stroke: #ea580c; fill: #ea580c; }
+    .nixl { stroke: #16a34a; fill: #16a34a; }
+    .series { fill: none; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; }
+  </style>
+
+  <rect width="1100" height="940" fill="white"/>
+
+  <!-- PUT -->
+  <text x="500" y="30" text-anchor="middle" class="title">SimpleStorage PUT median throughput</text>
+  <text x="45" y="245" text-anchor="middle" class="axis" transform="rotate(-90 45 245)">MiB/s</text>
+  <line x1="80" y1="90" x2="900" y2="90" class="grid"/>
+  <line x1="80" y1="165" x2="900" y2="165" class="grid"/>
+  <line x1="80" y1="240" x2="900" y2="240" class="grid"/>
+  <line x1="80" y1="315" x2="900" y2="315" class="grid"/>
+  <line x1="80" y1="390" x2="900" y2="390" class="axis-line"/>
+  <line x1="80" y1="90" x2="80" y2="390" class="axis-line"/>
+  <text x="68" y="395" text-anchor="end" class="axis">0</text>
+  <text x="68" y="320" text-anchor="end" class="axis">30</text>
+  <text x="68" y="245" text-anchor="end" class="axis">60</text>
+  <text x="68" y="170" text-anchor="end" class="axis">90</text>
+  <text x="68" y="95" text-anchor="end" class="axis">120</text>
+  <polyline class="series zmq" points="100,364.43 180,338.31 260,302.28 340,260.66 420,179.83 500,128.82 580,115.21 660,112.37 740,110.87 820,110.60 900,109.76"/>
+  <polyline class="series ucx" points="100,324.91 180,300.61 260,255.18 340,209.43 420,146.43 500,123.14 580,116.55 660,115.41 740,114.82 820,114.46 900,114.26"/>
+  <polyline class="series nixl" points="100,320.14 180,282.42 260,253.56 340,191.94 420,143.89 500,124.61 580,118.95 660,118.03 740,117.49 820,117.23 900,117.07"/>
+  <g class="zmq"><circle cx="100" cy="364.43" r="3"/><circle cx="180" cy="338.31" r="3"/><circle cx="260" cy="302.28" r="3"/><circle cx="340" cy="260.66" r="3"/><circle cx="420" cy="179.83" r="3"/><circle cx="500" cy="128.82" r="3"/><circle cx="580" cy="115.21" r="3"/><circle cx="660" cy="112.37" r="3"/><circle cx="740" cy="110.87" r="3"/><circle cx="820" cy="110.60" r="3"/><circle cx="900" cy="109.76" r="3"/><text x="920" y="115" class="label">ZMQ</text></g>
+  <g class="ucx"><circle cx="100" cy="324.91" r="3"/><circle cx="180" cy="300.61" r="3"/><circle cx="260" cy="255.18" r="3"/><circle cx="340" cy="209.43" r="3"/><circle cx="420" cy="146.43" r="3"/><circle cx="500" cy="123.14" r="3"/><circle cx="580" cy="116.55" r="3"/><circle cx="660" cy="115.41" r="3"/><circle cx="740" cy="114.82" r="3"/><circle cx="820" cy="114.46" r="3"/><circle cx="900" cy="114.26" r="3"/><text x="920" y="130" class="label">UCX</text></g>
+  <g class="nixl"><circle cx="100" cy="320.14" r="3"/><circle cx="180" cy="282.42" r="3"/><circle cx="260" cy="253.56" r="3"/><circle cx="340" cy="191.94" r="3"/><circle cx="420" cy="143.89" r="3"/><circle cx="500" cy="124.61" r="3"/><circle cx="580" cy="118.95" r="3"/><circle cx="660" cy="118.03" r="3"/><circle cx="740" cy="117.49" r="3"/><circle cx="820" cy="117.23" r="3"/><circle cx="900" cy="117.07" r="3"/><text x="920" y="145" class="label">NIXL-UCX</text></g>
+
+  <!-- GET -->
+  <text x="500" y="470" text-anchor="middle" class="title">SimpleStorage GET median throughput</text>
+  <text x="45" y="685" text-anchor="middle" class="axis" transform="rotate(-90 45 685)">MiB/s</text>
+  <line x1="80" y1="520" x2="900" y2="520" class="grid"/>
+  <line x1="80" y1="595" x2="900" y2="595" class="grid"/>
+  <line x1="80" y1="670" x2="900" y2="670" class="grid"/>
+  <line x1="80" y1="745" x2="900" y2="745" class="grid"/>
+  <line x1="80" y1="820" x2="900" y2="820" class="axis-line"/>
+  <line x1="80" y1="520" x2="80" y2="820" class="axis-line"/>
+  <text x="68" y="825" text-anchor="end" class="axis">0</text>
+  <text x="68" y="750" text-anchor="end" class="axis">30</text>
+  <text x="68" y="675" text-anchor="end" class="axis">60</text>
+  <text x="68" y="600" text-anchor="end" class="axis">90</text>
+  <text x="68" y="525" text-anchor="end" class="axis">120</text>
+  <polyline class="series zmq" points="100,793.87 180,768.84 260,734.89 340,690.30 420,607.40 500,559.18 580,547.48 660,545.38 740,543.64 820,541.06 900,539.81"/>
+  <polyline class="series ucx" points="100,750.94 180,722.45 260,676.65 340,639.13 420,580.38 500,543.36 580,536.95 660,535.58 740,534.85 820,534.51 900,534.28"/>
+  <polyline class="series nixl" points="100,754.85 180,726.29 260,664.96 340,625.76 420,576.94 500,544.89 580,539.26 660,538.22 740,537.47 820,537.24 900,537.06"/>
+  <g class="zmq"><circle cx="100" cy="793.87" r="3"/><circle cx="180" cy="768.84" r="3"/><circle cx="260" cy="734.89" r="3"/><circle cx="340" cy="690.30" r="3"/><circle cx="420" cy="607.40" r="3"/><circle cx="500" cy="559.18" r="3"/><circle cx="580" cy="547.48" r="3"/><circle cx="660" cy="545.38" r="3"/><circle cx="740" cy="543.64" r="3"/><circle cx="820" cy="541.06" r="3"/><circle cx="900" cy="539.81" r="3"/><text x="920" y="545" class="label">ZMQ</text></g>
+  <g class="ucx"><circle cx="100" cy="750.94" r="3"/><circle cx="180" cy="722.45" r="3"/><circle cx="260" cy="676.65" r="3"/><circle cx="340" cy="639.13" r="3"/><circle cx="420" cy="580.38" r="3"/><circle cx="500" cy="543.36" r="3"/><circle cx="580" cy="536.95" r="3"/><circle cx="660" cy="535.58" r="3"/><circle cx="740" cy="534.85" r="3"/><circle cx="820" cy="534.51" r="3"/><circle cx="900" cy="534.28" r="3"/><text x="920" y="560" class="label">UCX</text></g>
+  <g class="nixl"><circle cx="100" cy="754.85" r="3"/><circle cx="180" cy="726.29" r="3"/><circle cx="260" cy="664.96" r="3"/><circle cx="340" cy="625.76" r="3"/><circle cx="420" cy="576.94" r="3"/><circle cx="500" cy="544.89" r="3"/><circle cx="580" cy="539.26" r="3"/><circle cx="660" cy="538.22" r="3"/><circle cx="740" cy="537.47" r="3"/><circle cx="820" cy="537.24" r="3"/><circle cx="900" cy="537.06" r="3"/><text x="920" y="575" class="label">NIXL-UCX</text></g>
+
+  <g class="axis" text-anchor="middle">
+    <text x="100" y="412">128K</text><text x="180" y="412">256K</text><text x="260" y="412">512K</text><text x="340" y="412">1M</text><text x="420" y="412">4M</text><text x="500" y="412">16M</text><text x="580" y="412">64M</text><text x="660" y="412">128M</text><text x="740" y="412">256M</text><text x="820" y="412">512M</text><text x="900" y="412">1G</text>
+    <text x="100" y="842">128K</text><text x="180" y="842">256K</text><text x="260" y="842">512K</text><text x="340" y="842">1M</text><text x="420" y="842">4M</text><text x="500" y="842">16M</text><text x="580" y="842">64M</text><text x="660" y="842">128M</text><text x="740" y="842">256M</text><text x="820" y="842">512M</text><text x="900" y="842">1G</text>
+  </g>
+  <text x="500" y="885" text-anchor="middle" class="axis">logical payload size</text>
+</svg>

@@ -32,6 +32,13 @@ backend:
     num_data_storage_units: 2
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null
+    # Payload transfer backend. With nixl-ucx, all non-empty payloads use NIXL-UCX.
+    payload_transfer:
+      backend: zmq
+      # To use NIXL-UCX, replace the backend above with nixl-ucx.
+      # Optional UCX environment variables; omit to use UCX defaults.
+      # ucx_env_vars: {}
+      # See docs/nixl_ucx_payload.md for UCX transport and device configuration.
 
   # MooncakeStore: high-performance KV-based hierarchical storage
   # that supports RDMA transport between GPU and DRAM.
