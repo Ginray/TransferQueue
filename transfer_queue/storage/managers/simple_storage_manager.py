@@ -21,19 +21,31 @@ from collections.abc import Mapping
 from operator import itemgetter
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
+from uuid import uuid4
 
 import torch
 import zmq
+import zmq.asyncio
 from omegaconf import DictConfig
 from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
+from transfer_queue.storage.payload_transfer import (
+    PayloadDescriptor,
+    ReceiveToken,
+    TransferEndpoint,
+    create_payload_transfer,
+    parse_payload_transfer_config,
+)
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.serial_utils import calc_packed_size, decode, encode, unpack_from
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
+    create_zmq_socket,
+    format_zmq_address,
     with_zmq_socket,
 )
 
@@ -96,6 +108,16 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
+        self.payload_transfer_backend, ucx_env_vars = parse_payload_transfer_config(config.get("payload_transfer"))
+        payload_transfer_config = {
+            "backend": self.payload_transfer_backend,
+            "ucx_env_vars": ucx_env_vars,
+        }
+        self.payload_transfer_endpoints = config.get("payload_transfer_endpoints", {}) or {}
+        endpoints_ready = set(self.storage_unit_infos) == set(self.payload_transfer_endpoints)
+        if self.payload_transfer_backend != "zmq" and not endpoints_ready:
+            raise RuntimeError("SimpleStorage payload transfer endpoints are missing")
+        self.payload_transfer = create_payload_transfer(payload_transfer_config)
 
     def _register_servers(self, server_infos: "ZMQServerInfo | dict[Any, ZMQServerInfo]"):
         """Register and validate server information.
@@ -298,6 +320,14 @@ class AsyncSimpleStorageManager(StorageManager):
         Send data to a specific storage unit.
         """
 
+        if self.payload_transfer is not None:
+            frames = tuple(encode(storage_data))
+            payload_bytes = calc_packed_size(frames)
+            await self._put_via_payload_transfer(
+                global_indexes, frames, payload_bytes, target_storage_unit, data_parser, socket
+            )
+            return
+
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.PUT_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
@@ -332,6 +362,64 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"{target_storage_unit}: {type(e).__name__}: {e}"
             )
             raise RuntimeError(f"Error in put to storage unit {target_storage_unit}: {type(e).__name__}: {e}") from e
+
+    async def _put_via_payload_transfer(
+        self,
+        global_indexes: list[int],
+        frames: tuple[bytes | bytearray | memoryview, ...],
+        payload_bytes: int,
+        target_storage_unit: str,
+        data_parser: Callable[[Any], Any] | None,
+        socket: zmq.Socket,
+    ) -> None:
+        """PUT handshake: prepare receive -> payload send -> commit/store."""
+        descriptor = PayloadDescriptor(
+            transfer_id=uuid4().hex,
+            payload_bytes=payload_bytes,
+            frame_sizes=tuple(memoryview(frame).nbytes for frame in frames),
+        )
+        # PREPARE may have succeeded even when its response is lost.
+        remote_may_be_prepared = True
+        prepare = ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_DATA_PREPARE,
+            sender_id=self.storage_manager_id,
+            receiver_id=target_storage_unit,
+            body={
+                "global_indexes": global_indexes,
+                "descriptor": descriptor.to_dict(),
+                "data_parser": data_parser,
+            },
+        )
+        try:
+            await socket.send_multipart(prepare.serialize(), copy=False)
+            ready = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
+            self._expect(ready, ZMQRequestType.PUT_DATA_READY, target_storage_unit)
+            ready_descriptor = PayloadDescriptor.from_dict(ready.body["descriptor"])
+            if ready_descriptor != descriptor:
+                raise RuntimeError(f"PUT descriptor changed by storage unit {target_storage_unit}")
+            token = ReceiveToken.from_dict(ready.body["receive_token"])
+            endpoint = TransferEndpoint.from_dict(self.payload_transfer_endpoints[target_storage_unit]["endpoint"])
+            assert self.payload_transfer is not None
+            await asyncio.wrap_future(self.payload_transfer.send(endpoint, token, descriptor, frames))
+            commit = ZMQMessage.create(
+                request_type=ZMQRequestType.PUT_DATA_COMMIT,
+                sender_id=self.storage_manager_id,
+                receiver_id=target_storage_unit,
+                body={"transfer_id": descriptor.transfer_id},
+            )
+            await socket.send_multipart(commit.serialize(), copy=False)
+            response = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
+            self._expect(response, ZMQRequestType.PUT_DATA_RESPONSE, target_storage_unit)
+            remote_may_be_prepared = False
+        except BaseException:
+            if remote_may_be_prepared:
+                await self._cancel_payload_transfer(
+                    ZMQRequestType.PUT_DATA_CANCEL,
+                    descriptor.transfer_id,
+                    target_storage_unit,
+                    ZMQRequestType.PUT_DATA_RESPONSE,
+                )
+            raise
 
     @staticmethod
     def _pack_field_values(values: list) -> torch.Tensor | NonTensorStack:
@@ -441,6 +529,8 @@ class AsyncSimpleStorageManager(StorageManager):
         socket: zmq.Socket = None,
     ):
         """Get data from a single SU by global index keys."""
+        if self.payload_transfer is not None:
+            return await self._get_via_payload_transfer(global_indexes, fields, target_storage_unit, socket)
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
@@ -476,6 +566,117 @@ class AsyncSimpleStorageManager(StorageManager):
             raise RuntimeError(
                 f"Error getting data from storage unit {target_storage_unit}: {type(e).__name__}: {e}"
             ) from e
+
+    async def _get_via_payload_transfer(
+        self, global_indexes: list[int], fields: list[str], target_storage_unit: str, socket: zmq.Socket
+    ):
+        """GET handshake: encode -> post receive -> commit/start send -> decode."""
+        transfer_id = uuid4().hex
+        remote_prepared = False
+        receive_prepared = False
+        descriptor = None
+        prepare = ZMQMessage.create(
+            request_type=ZMQRequestType.GET_DATA_PREPARE,
+            sender_id=self.storage_manager_id,
+            receiver_id=target_storage_unit,
+            body={
+                "global_indexes": global_indexes,
+                "fields": fields,
+                "transfer_id": transfer_id,
+            },
+        )
+        try:
+            await socket.send_multipart(prepare.serialize(), copy=False)
+            remote_prepared = True
+            ready = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
+            self._expect(ready, ZMQRequestType.GET_DATA_READY, target_storage_unit)
+            descriptor = PayloadDescriptor.from_dict(ready.body["descriptor"])
+            if descriptor.transfer_id != transfer_id:
+                raise RuntimeError(f"GET descriptor identity changed by storage unit {target_storage_unit}")
+            assert self.payload_transfer is not None
+            token = self.payload_transfer.prepare_receive(descriptor)
+            receive_prepared = True
+            commit = ZMQMessage.create(
+                request_type=ZMQRequestType.GET_DATA_COMMIT,
+                sender_id=self.storage_manager_id,
+                receiver_id=target_storage_unit,
+                body={
+                    "transfer_id": descriptor.transfer_id,
+                    "receiver_endpoint": self.payload_transfer.endpoint().to_dict(),
+                    "receive_token": token.to_dict(),
+                },
+            )
+            await socket.send_multipart(commit.serialize(), copy=False)
+            response = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
+            self._expect(response, ZMQRequestType.GET_DATA_RESPONSE, target_storage_unit)
+            remote_prepared = False
+            # The response confirms that the remote write has completed.
+            payload = await asyncio.wrap_future(self.payload_transfer.receive(descriptor))
+            frames = unpack_from(payload)
+            result = decode(frames)
+            return fields, result
+        except BaseException:
+            if receive_prepared and descriptor is not None:
+                self.payload_transfer.cancel_receive(descriptor.transfer_id)
+            if remote_prepared:
+                await self._cancel_payload_transfer(
+                    ZMQRequestType.GET_DATA_CANCEL,
+                    transfer_id,
+                    target_storage_unit,
+                    ZMQRequestType.GET_DATA_RESPONSE,
+                )
+            raise
+
+    async def _cancel_payload_transfer(
+        self,
+        request_type: ZMQRequestType,
+        transfer_id: str,
+        target_storage_unit: str,
+        expected_response: ZMQRequestType,
+    ) -> None:
+        """Send cancellation on a fresh DEALER to avoid consuming a late response."""
+        server_info = self.storage_unit_infos[target_storage_unit]
+        context = zmq.asyncio.Context()
+        cancel_socket = create_zmq_socket(
+            context,
+            zmq.DEALER,
+            server_info.ip,
+            identity=(f"{self.storage_manager_id}_cancel_{target_storage_unit}_{uuid4().hex[:8]}").encode(),
+        )
+        timeout_ms = min(TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT, 10) * 1000
+        cancel_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        cancel_socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        cancel_socket.connect(format_zmq_address(server_info.ip, server_info.ports["put_get_socket"]))
+        cancel = ZMQMessage.create(
+            request_type=request_type,
+            sender_id=self.storage_manager_id,
+            receiver_id=target_storage_unit,
+            body={"transfer_id": transfer_id},
+        )
+        try:
+            await cancel_socket.send_multipart(cancel.serialize(), copy=False)
+            response = ZMQMessage.deserialize(await cancel_socket.recv_multipart(copy=False))
+            self._expect(response, expected_response, target_storage_unit)
+        except Exception as exc:
+            logger.warning(
+                "[%s]: failed to cancel %s transfer_id=%s at storage unit %s: %s",
+                self.storage_manager_id,
+                request_type.value,
+                transfer_id,
+                target_storage_unit,
+                exc,
+            )
+        finally:
+            cancel_socket.close(linger=0)
+            context.term()
+
+    @staticmethod
+    def _expect(response: ZMQMessage, expected: ZMQRequestType, storage_unit_id: str) -> None:
+        if response.request_type != expected:
+            raise RuntimeError(
+                f"storage unit {storage_unit_id} returned {response.request_type}: "
+                f"{response.body.get('message', 'unknown error')}"
+            )
 
     async def clear_data(self, metadata: BatchMeta) -> None:
         """Clear data in remote StorageUnit.
@@ -652,5 +853,9 @@ class AsyncSimpleStorageManager(StorageManager):
         logger.info(f"[{self.storage_manager_id}]: restored {len(su_ids)} storage units from {su_dir}")
 
     def close(self) -> None:
-        """Close all ZMQ sockets and context to prevent resource leaks."""
-        super().close()
+        """Close payload transfer resources before ZMQ ownership is released."""
+        try:
+            if self.payload_transfer is not None:
+                self.payload_transfer.close()
+        finally:
+            super().close()
