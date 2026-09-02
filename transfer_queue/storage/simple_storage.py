@@ -311,7 +311,7 @@ class SimpleStorageUnit:
                     logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
 
                     if operation in (ZMQRequestType.PUT_DATA, ZMQRequestType.GET_DATA):
-                        with monitor.measure(op_type=operation.value):
+                        with monitor.measure(op_type=operation.name):
                             response_msg = self.payload_transfer.handle_request(
                                 request_msg,
                                 storage_id=self.storage_unit_id,

@@ -55,10 +55,18 @@ class ZmqPayloadTransfer(PayloadTransfer):
         try:
             await control_socket.send_multipart(request.serialize(), copy=False)
             response = ZMQMessage.deserialize(await control_socket.recv_multipart(copy=False))
-            self._expect(response, ZMQRequestType.PUT_DATA_RESPONSE, target_id)
+            if response.request_type != ZMQRequestType.PUT_DATA_RESPONSE:
+                raise RuntimeError(
+                    f"Failed to put data to storage unit {target_id}: "
+                    f"{response.body.get('message', 'Unknown error')}"
+                )
         except zmq.error.Again as exc:
             self._raise_timeout(sender_id, target_id, "put", exc)
         except Exception as exc:
+            logger.error(
+                f"[{sender_id}]: Unexpected error during put to storage unit "
+                f"{target_id}: {type(exc).__name__}: {exc}"
+            )
             raise RuntimeError(f"Error in put to storage unit {target_id}: {type(exc).__name__}: {exc}") from exc
 
     async def get(
@@ -79,11 +87,19 @@ class ZmqPayloadTransfer(PayloadTransfer):
         try:
             await control_socket.send_multipart(request.serialize())
             response = ZMQMessage.deserialize(await control_socket.recv_multipart(copy=False))
-            self._expect(response, ZMQRequestType.GET_DATA_RESPONSE, target_id)
+            if response.request_type != ZMQRequestType.GET_DATA_RESPONSE:
+                raise RuntimeError(
+                    f"Failed to get data from storage unit {target_id}: "
+                    f"{response.body.get('message', 'Unknown error')}"
+                )
             return response.body["data"]
         except zmq.error.Again as exc:
             self._raise_timeout(sender_id, target_id, "get", exc)
         except Exception as exc:
+            logger.error(
+                f"[{sender_id}]: Unexpected error from storage unit "
+                f"{target_id}: {type(exc).__name__}: {exc}"
+            )
             raise RuntimeError(f"Error getting data from storage unit {target_id}: {type(exc).__name__}: {exc}") from exc
 
     def handle_request(
@@ -96,7 +112,9 @@ class ZmqPayloadTransfer(PayloadTransfer):
     ) -> ZMQMessage | None:
         if request.request_type == ZMQRequestType.PUT_DATA:
             try:
-                with limit_pytorch_auto_parallel_threads(target_num_threads=TQ_NUM_THREADS, info=f"[{storage_id}] PUT"):
+                with limit_pytorch_auto_parallel_threads(
+                    target_num_threads=TQ_NUM_THREADS, info=f"[{storage_id}] _handle_put"
+                ):
                     store_data(
                         request.body["global_indexes"],
                         request.body["data"],
@@ -104,24 +122,37 @@ class ZmqPayloadTransfer(PayloadTransfer):
                     )
                 return self._response(ZMQRequestType.PUT_DATA_RESPONSE, storage_id)
             except Exception as exc:
-                return self._error(ZMQRequestType.PUT_ERROR, storage_id, "put", exc)
+                return ZMQMessage.create(
+                    request_type=ZMQRequestType.PUT_ERROR,
+                    sender_id=storage_id,
+                    body={
+                        "message": f"Failed to put data into storage unit id "
+                        f"#{storage_id}, detail error message: {str(exc)}"
+                    },
+                )
 
         if request.request_type == ZMQRequestType.GET_DATA:
-            fields = request.body.get("fields")
-            global_indexes = request.body.get("global_indexes")
             try:
-                with limit_pytorch_auto_parallel_threads(target_num_threads=TQ_NUM_THREADS, info=f"[{storage_id}] GET"):
+                fields = request.body["fields"]
+                global_indexes = request.body["global_indexes"]
+                with limit_pytorch_auto_parallel_threads(
+                    target_num_threads=TQ_NUM_THREADS, info=f"[{storage_id}] _handle_get"
+                ):
                     data = load_data(fields, global_indexes)
                 return self._response(ZMQRequestType.GET_DATA_RESPONSE, storage_id, {"data": data})
             except Exception as exc:
                 logger.error(
-                    "[%s]: ZMQ GET failed, fields=%s, global_indexes=%s: %s",
-                    storage_id,
-                    fields,
-                    global_indexes,
-                    exc,
+                    f"[{storage_id}]: _handle_get error, "
+                    f"fields={fields}, global_indexes={global_indexes}: {type(exc).__name__}: {exc}"
                 )
-                return self._error(ZMQRequestType.GET_ERROR, storage_id, "get", exc)
+                return ZMQMessage.create(
+                    request_type=ZMQRequestType.GET_ERROR,
+                    sender_id=storage_id,
+                    body={
+                        "message": f"Failed to get data from storage unit id #{storage_id}, "
+                        f"detail error message: {str(exc)}"
+                    },
+                )
 
         return None
 
@@ -130,29 +161,18 @@ class ZmqPayloadTransfer(PayloadTransfer):
         return ZMQMessage.create(request_type=request_type, sender_id=sender_id, body=body or {})
 
     @staticmethod
-    def _error(request_type: ZMQRequestType, sender_id: str, operation: str, error: Exception) -> ZMQMessage:
-        return ZMQMessage.create(
-            request_type=request_type,
-            sender_id=sender_id,
-            body={"message": f"Failed to {operation} data in storage unit id #{sender_id}: {error}"},
-        )
-
-    @staticmethod
-    def _expect(response: ZMQMessage, expected: ZMQRequestType, target_id: str) -> None:
-        if response.request_type != expected:
-            raise RuntimeError(
-                f"storage unit {target_id} returned {response.request_type}: "
-                f"{response.body.get('message', 'unknown error')}"
-            )
-
     @staticmethod
     def _raise_timeout(sender_id: str, target_id: str, operation: str, error: Exception) -> None:
         timeout = TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT
+        if operation == "put":
+            logger.error(
+                f"[{sender_id}]: ZMQ recv timeout ({timeout}s) during put to storage unit {target_id}. "
+                "The storage unit may be overloaded or crashed."
+            )
+            raise RuntimeError(f"ZMQ recv timeout ({timeout}s) during put to storage unit {target_id}") from error
+
         logger.error(
-            "[%s]: ZMQ recv timeout (%ss) during %s to storage unit %s; it may be overloaded or crashed",
-            sender_id,
-            timeout,
-            operation,
-            target_id,
+            f"[{sender_id}]: ZMQ recv timeout ({timeout}s) from storage unit {target_id}. "
+            "The storage unit may be overloaded or crashed."
         )
-        raise RuntimeError(f"ZMQ recv timeout ({timeout}s) during {operation} to storage unit {target_id}") from error
+        raise RuntimeError(f"ZMQ recv timeout ({timeout}s) from storage unit {target_id}") from error
