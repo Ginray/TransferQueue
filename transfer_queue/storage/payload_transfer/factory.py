@@ -41,6 +41,7 @@ def create_payload_transfer(
     value: object | None = None,
     *,
     peer_infos: Mapping[str, object] | None = None,
+    control_peer_infos: Mapping[str, object] | None = None,
 ) -> PayloadTransfer:
     """Create the configured SimpleStorage payload transfer strategy."""
     backend, options = parse_payload_transfer_config(value)
@@ -57,6 +58,7 @@ def create_payload_transfer(
         return NixlPayloadTransfer(
             ucx_env_vars=None if ucx_env_vars is None else dict(ucx_env_vars),
             peer_infos=peer_infos,
+            control_peer_infos=control_peer_infos,
         )
 
     raise RuntimeError(f"unhandled SimpleStorage payload transfer: {backend!r}")

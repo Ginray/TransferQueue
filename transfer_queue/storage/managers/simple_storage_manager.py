@@ -103,6 +103,7 @@ class AsyncSimpleStorageManager(StorageManager):
         self.payload_transfer = create_payload_transfer(
             config.get("payload_transfer"),
             peer_infos=config.get("payload_transfer_infos", {}) or {},
+            control_peer_infos=self.storage_unit_infos,
         )
 
     def _register_servers(self, server_infos: "ZMQServerInfo | dict[Any, ZMQServerInfo]"):

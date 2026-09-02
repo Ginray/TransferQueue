@@ -161,7 +161,6 @@ class ZmqPayloadTransfer(PayloadTransfer):
         return ZMQMessage.create(request_type=request_type, sender_id=sender_id, body=body or {})
 
     @staticmethod
-    @staticmethod
     def _raise_timeout(sender_id: str, target_id: str, operation: str, error: Exception) -> None:
         timeout = TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT
         if operation == "put":
