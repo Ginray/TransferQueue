@@ -142,14 +142,16 @@ class NixlPayloadTransfer(PayloadTransfer):
         peer_infos: dict[str, object] | None = None,
         control_peer_infos: dict[str, object] | None = None,
     ):
+        self._peer_infos = dict(peer_infos or {})
+        self._control_peer_infos = dict(control_peer_infos or {})
+        if self._control_peer_infos and set(self._control_peer_infos) != set(self._peer_infos):
+            raise RuntimeError("SimpleStorage payload transfer endpoints are missing")
         try:
             self._runtime = NixlRuntime(ucx_env_vars)
         except NixlError:
             raise
         except Exception as exc:
             raise NixlError(f"failed to create NIXL runtime: {exc}") from exc
-        self._peer_infos = dict(peer_infos or {})
-        self._control_peer_infos = dict(control_peer_infos or {})
         self._pending_puts: dict[str, _PendingPut] = {}
         self._pending_gets: dict[str, _PendingGet] = {}
 
