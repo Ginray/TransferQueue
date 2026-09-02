@@ -24,13 +24,14 @@ import pytest
 from omegaconf import OmegaConf
 
 from transfer_queue.storage.payload_transfer import (
-    PayloadDescriptor,
     PayloadTransferError,
     create_payload_transfer,
     parse_payload_transfer_config,
 )
-from transfer_queue.storage.payload_transfer.nixl import NixlPayloadTransfer
+from transfer_queue.storage.payload_transfer.nixl import NixlPayloadTransfer, PayloadDescriptor
 from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import _configure_ucx_environment
+from transfer_queue.storage.payload_transfer.zmq import ZmqPayloadTransfer
+from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
 
 def test_payload_descriptor_preserves_frame_layout():
@@ -119,6 +120,50 @@ def test_empty_yaml_ucx_settings_preserve_process_environment(monkeypatch):
 def test_payload_transfer_rejects_unsupported_backend():
     with pytest.raises(ValueError, match="expected 'zmq' or 'nixl-ucx'"):
         create_payload_transfer({"backend": "unsupported"})
+
+
+def test_factory_returns_zmq_payload_transfer():
+    transfer = create_payload_transfer({"backend": "zmq"})
+
+    assert isinstance(transfer, ZmqPayloadTransfer)
+    assert transfer.bootstrap_info() is None
+
+
+def test_zmq_payload_transfer_handles_put_and_get_requests():
+    stored = {}
+    transfer = ZmqPayloadTransfer()
+
+    put_request = ZMQMessage.create(
+        request_type=ZMQRequestType.PUT_DATA,
+        sender_id="manager",
+        receiver_id="storage",
+        body={"global_indexes": [1], "data": {"value": [42]}},
+    )
+    put_response = transfer.handle_request(
+        put_request,
+        storage_id="storage",
+        load_data=lambda fields, indexes: {field: stored[field] for field in fields},
+        store_data=lambda indexes, data, parser: stored.update(data),
+    )
+
+    assert put_response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+    assert stored == {"value": [42]}
+
+    get_request = ZMQMessage.create(
+        request_type=ZMQRequestType.GET_DATA,
+        sender_id="manager",
+        receiver_id="storage",
+        body={"global_indexes": [1], "fields": ["value"]},
+    )
+    get_response = transfer.handle_request(
+        get_request,
+        storage_id="storage",
+        load_data=lambda fields, indexes: {field: stored[field] for field in fields},
+        store_data=lambda indexes, data, parser: stored.update(data),
+    )
+
+    assert get_response.request_type == ZMQRequestType.GET_DATA_RESPONSE
+    assert get_response.body["data"] == {"value": [42]}
 
 
 def test_payload_transfer_config_extracts_ucx_settings():

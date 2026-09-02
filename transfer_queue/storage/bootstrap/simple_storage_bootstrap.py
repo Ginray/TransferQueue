@@ -64,12 +64,7 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     storage_zmq_info = process_zmq_server_info(simple_storage_handles)
     backend_name = conf.backend.storage_backend
     conf.backend[backend_name].zmq_info = storage_zmq_info
-    if payload_transfer_backend != "zmq":
-        endpoint_infos = ray.get(
-            [storage.get_payload_transfer_info.remote() for storage in simple_storage_handles.values()]
-        )
-        if not all(endpoint_infos):
-            raise RuntimeError("SimpleStorage payload transfer did not initialize on every StorageUnit")
-        conf.backend[backend_name].payload_transfer_endpoints = {info["id"]: info for info in endpoint_infos}
+    infos = ray.get([storage.get_payload_transfer_info.remote() for storage in simple_storage_handles.values()])
+    conf.backend[backend_name].payload_transfer_infos = {info["id"]: info for info in infos if info is not None}
 
     return simple_storage_handles

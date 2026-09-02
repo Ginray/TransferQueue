@@ -27,10 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from transfer_queue.storage.payload_transfer.base import (
-    PayloadDescriptor,
-    PayloadTransferError,
-)
+from transfer_queue.storage.payload_transfer.base import PayloadTransferError
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.serial_utils import initialize_packed_frame_table
 
@@ -157,7 +154,7 @@ class NixlRuntime:
             self._ensure_open()
             return self._agent.get_agent_metadata()
 
-    def prepare_receive(self, descriptor: PayloadDescriptor) -> dict[str, Any]:
+    def prepare_receive(self, descriptor: Any) -> dict[str, Any]:
         """Allocate or reuse registered storage for a scatter receive."""
         descriptor.validate()
         if not descriptor.frame_sizes or not any(descriptor.frame_sizes):
@@ -195,7 +192,7 @@ class NixlRuntime:
         self,
         endpoint: dict[str, Any],
         token: dict[str, Any],
-        descriptor: PayloadDescriptor,
+        descriptor: Any,
         frames: tuple[bytes | bytearray | memoryview, ...],
     ) -> Future[None]:
         """Run the NIXL transfer on the dedicated send thread."""
@@ -329,7 +326,7 @@ class NixlRuntime:
     def _validate_send_metadata(
         endpoint: dict[str, Any],
         token: dict[str, Any],
-        descriptor: PayloadDescriptor,
+        descriptor: Any,
     ) -> tuple[str, bytes]:
         remote_name = str(token.get("agent_name") or endpoint.get("agent_name") or "")
         metadata = token.get("agent_metadata") or endpoint.get("agent_metadata")
@@ -341,7 +338,7 @@ class NixlRuntime:
             raise NixlError("NIXL receive token is missing frame descriptors")
         return remote_name, metadata
 
-    def receive(self, descriptor: PayloadDescriptor) -> Future[memoryview]:
+    def receive(self, descriptor: Any) -> Future[memoryview]:
         """Complete a prepared receive and return detached packed payload bytes."""
         descriptor.validate()
         future: Future[memoryview] = Future()

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Construction helper for optional SimpleStorage payload transfer."""
+"""Construction helper for SimpleStorage payload transfer strategies."""
 
 from collections.abc import Mapping
 
@@ -37,14 +37,20 @@ def parse_payload_transfer_config(value: object | None = None) -> tuple[str, dic
     return backend, dict(ucx_env_vars)
 
 
-def create_payload_transfer(value: object | None = None) -> PayloadTransfer | None:
-    """Create the optional data plane from a payload transfer config block."""
+def create_payload_transfer(
+    value: object | None = None,
+    *,
+    peer_infos: Mapping[str, object] | None = None,
+) -> PayloadTransfer:
+    """Create the configured SimpleStorage payload transfer strategy."""
     backend, ucx_env_vars = parse_payload_transfer_config(value)
     if backend == "zmq":
-        return None
+        from transfer_queue.storage.payload_transfer.zmq import ZmqPayloadTransfer
+
+        return ZmqPayloadTransfer()
     if backend == "nixl-ucx":
         from transfer_queue.storage.payload_transfer.nixl import NixlPayloadTransfer
 
-        return NixlPayloadTransfer(ucx_env_vars=ucx_env_vars)
+        return NixlPayloadTransfer(ucx_env_vars=ucx_env_vars, peer_infos=peer_infos)
 
     raise RuntimeError(f"unhandled SimpleStorage payload transfer: {backend!r}")

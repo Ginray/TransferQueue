@@ -18,7 +18,6 @@ import pickle
 import time
 import weakref
 from collections.abc import Mapping
-from dataclasses import dataclass
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -28,16 +27,12 @@ import ray
 import zmq
 
 from transfer_queue.storage.payload_transfer import (
-    PayloadDescriptor,
-    ReceiveToken,
-    TransferEndpoint,
     create_payload_transfer,
 )
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
-from transfer_queue.utils.serial_utils import calc_packed_size, decode, encode, unpack_from
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -55,21 +50,6 @@ logger = get_logger(__name__)
 
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))  # in seconds
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
-
-
-@dataclass
-class _PendingPut:
-    descriptor: PayloadDescriptor
-    sender_id: str
-    global_indexes: tuple[int, ...]
-    data_parser: Any
-
-
-@dataclass
-class _PendingGet:
-    descriptor: PayloadDescriptor
-    sender_id: str
-    frames: tuple[bytes | bytearray | memoryview, ...]
 
 
 class StorageUnitData:
@@ -195,8 +175,6 @@ class SimpleStorageUnit:
 
         self.storage_data = StorageUnitData(self.storage_unit_size)
         self.payload_transfer = create_payload_transfer(payload_transfer)
-        self._pending_puts: dict[str, _PendingPut] = {}
-        self._pending_gets: dict[str, _PendingGet] = {}
 
         # Internal communication address for proxy and workers
         self._inproc_addr = f"inproc://simple_storage_workers_{self.storage_unit_id}"
@@ -332,35 +310,32 @@ class SimpleStorageUnit:
                 try:
                     logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
 
-                    # Process request
-                    if operation == ZMQRequestType.PUT_DATA:  # type: ignore[arg-type]
-                        with monitor.measure(op_type="PUT_DATA"):
-                            response_msg = self._handle_put(request_msg)
-                    elif operation == ZMQRequestType.PUT_DATA_PREPARE:
-                        response_msg = self._handle_put_prepare(request_msg)
-                    elif operation == ZMQRequestType.PUT_DATA_COMMIT:
-                        response_msg = self._handle_put_commit(request_msg)
-                    elif operation == ZMQRequestType.PUT_DATA_CANCEL:
-                        response_msg = self._handle_put_cancel(request_msg)
-                    elif operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
-                        with monitor.measure(op_type="GET_DATA"):
-                            response_msg = self._handle_get(request_msg)
-                    elif operation == ZMQRequestType.GET_DATA_PREPARE:
-                        response_msg = self._handle_get_prepare(request_msg)
-                    elif operation == ZMQRequestType.GET_DATA_COMMIT:
-                        response_msg = self._handle_get_commit(request_msg)
-                    elif operation == ZMQRequestType.GET_DATA_CANCEL:
-                        response_msg = self._handle_get_cancel(request_msg)
-                    elif operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
+                    if operation in (ZMQRequestType.PUT_DATA, ZMQRequestType.GET_DATA):
+                        with monitor.measure(op_type=operation.value):
+                            response_msg = self.payload_transfer.handle_request(
+                                request_msg,
+                                storage_id=self.storage_unit_id,
+                                load_data=self.storage_data.get_data,
+                                store_data=self._put_decoded_data,
+                            )
+                    else:
+                        response_msg = self.payload_transfer.handle_request(
+                            request_msg,
+                            storage_id=self.storage_unit_id,
+                            load_data=self.storage_data.get_data,
+                            store_data=self._put_decoded_data,
+                        )
+
+                    if response_msg is None and operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
                         with monitor.measure(op_type="CLEAR_DATA"):
                             response_msg = self._handle_clear(request_msg)
-                    elif operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
+                    elif response_msg is None and operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
                         response_msg = self._handle_get_metrics()
-                    elif operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
+                    elif response_msg is None and operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                         response_msg = self._handle_save_checkpoint(request_msg)
-                    elif operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
+                    elif response_msg is None and operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                         response_msg = self._handle_load_checkpoint(request_msg)
-                    else:
+                    elif response_msg is None:
                         response_msg = ZMQMessage.create(
                             request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,  # type: ignore[arg-type]
                             sender_id=self.storage_unit_id,
@@ -389,237 +364,6 @@ class SimpleStorageUnit:
         logger.info(f"[{self.storage_unit_id}]: worker stopped.")
         poller.unregister(worker_socket)
         worker_socket.close(linger=0)
-
-    def _handle_put(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """
-        Handle put request, add or update data into storage unit.
-
-        Args:
-            data_parts: ZMQMessage from client.
-
-        Returns:
-            Put data success response ZMQMessage.
-        """
-        try:
-            global_indexes = data_parts.body["global_indexes"]
-            field_data = data_parts.body["data"]  # field_data should be a dict.
-            data_parser = data_parts.body.get("data_parser", None)
-
-            with limit_pytorch_auto_parallel_threads(
-                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_put"
-            ):
-                self._put_decoded_data(global_indexes, field_data, data_parser)
-
-            # After put operation finish, send a message to the client
-            response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_DATA_RESPONSE,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={},
-            )
-
-            return response_msg
-        except Exception as e:
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_ERROR,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={
-                    "message": f"Failed to put data into storage unit id "
-                    f"#{self.storage_unit_id}, detail error message: {str(e)}"
-                },
-            )
-
-    def _handle_get(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """
-        Handle get request, return data from storage unit.
-
-        Args:
-            data_parts: ZMQMessage from client.
-
-        Returns:
-            Get data success response ZMQMessage, containing target data.
-        """
-        try:
-            fields = data_parts.body["fields"]
-            global_indexes = data_parts.body["global_indexes"]
-
-            with limit_pytorch_auto_parallel_threads(
-                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
-            ):
-                result_data = self.storage_data.get_data(fields, global_indexes)
-
-            response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={
-                    "data": result_data,
-                },
-            )
-        except Exception as e:
-            logger.error(
-                f"[{self.storage_unit_id}]: _handle_get error, "
-                f"fields={fields}, global_indexes={global_indexes}: {type(e).__name__}: {e}"
-            )
-            response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.GET_ERROR,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={
-                    "message": f"Failed to get data from storage unit id #{self.storage_unit_id}, "
-                    f"detail error message: {str(e)}"
-                },
-            )
-        return response_msg
-
-    def _handle_put_prepare(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """Prepare a receive before acknowledging a large PUT descriptor."""
-        if self.payload_transfer is None:
-            return self._payload_transfer_error("PUT prepare received while payload transfer is unavailable")
-        descriptor = None
-        receive_prepared = False
-        try:
-            descriptor = PayloadDescriptor.from_dict(data_parts.body["descriptor"])
-            if descriptor.transfer_id in self._pending_puts:
-                raise RuntimeError(f"duplicate PUT transfer_id: {descriptor.transfer_id}")
-            global_indexes = tuple(data_parts.body["global_indexes"])
-            token = self.payload_transfer.prepare_receive(descriptor)
-            receive_prepared = True
-            self._pending_puts[descriptor.transfer_id] = _PendingPut(
-                descriptor=descriptor,
-                sender_id=data_parts.sender_id,
-                global_indexes=global_indexes,
-                data_parser=data_parts.body.get("data_parser"),
-            )
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_DATA_READY,
-                sender_id=self.storage_unit_id,
-                body={"descriptor": descriptor.to_dict(), "receive_token": token.to_dict()},
-            )
-        except Exception as e:
-            if descriptor is not None and receive_prepared:
-                self._pending_puts.pop(descriptor.transfer_id, None)
-                self.payload_transfer.cancel_receive(descriptor.transfer_id)
-            return self._payload_transfer_error(f"PUT prepare failed: {e}")
-
-    def _handle_put_commit(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """Consume a completed PUT transfer and commit it through the existing store path."""
-        transfer_id = data_parts.body["transfer_id"]
-        owns_receive = False
-        try:
-            pending = self._pending_puts.get(transfer_id)
-            if pending is None:
-                raise RuntimeError(f"unknown or expired PUT transfer_id: {transfer_id}")
-            if pending.sender_id != data_parts.sender_id:
-                raise RuntimeError(f"PUT transfer {transfer_id} belongs to another sender")
-            self._pending_puts.pop(transfer_id)
-            owns_receive = True
-            payload = self.payload_transfer.receive(pending.descriptor).result() if self.payload_transfer else None
-            if payload is None:
-                raise RuntimeError("payload transfer is unavailable")
-            with limit_pytorch_auto_parallel_threads(
-                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_put_commit"
-            ):
-                frames = unpack_from(payload)
-                field_data = decode(frames)
-                self._put_decoded_data(list(pending.global_indexes), field_data, pending.data_parser)
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_DATA_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"transfer_id": transfer_id},
-            )
-        except Exception as e:
-            if owns_receive and self.payload_transfer is not None:
-                self.payload_transfer.cancel_receive(transfer_id)
-            return self._payload_transfer_error(f"PUT commit failed: {e}")
-
-    def _handle_put_cancel(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """Release a prepared PUT that will not be committed."""
-        transfer_id = data_parts.body["transfer_id"]
-        pending = self._pending_puts.get(transfer_id)
-        if pending is not None and pending.sender_id != data_parts.sender_id:
-            return self._payload_transfer_error(f"PUT transfer {transfer_id} belongs to another sender")
-        pending = self._pending_puts.pop(transfer_id, None)
-        if pending is not None and self.payload_transfer is not None:
-            self.payload_transfer.cancel_receive(transfer_id)
-        return ZMQMessage.create(
-            request_type=ZMQRequestType.PUT_DATA_RESPONSE,
-            sender_id=self.storage_unit_id,
-            body={"transfer_id": transfer_id},
-        )
-
-    def _handle_get_prepare(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """Encode GET data and retain it until the requester posts its receive."""
-        if self.payload_transfer is None:
-            return self._payload_transfer_error("GET prepare received while payload transfer is unavailable")
-        try:
-            transfer_id = str(data_parts.body["transfer_id"])
-            PayloadDescriptor.validate_transfer_id(transfer_id)
-            if transfer_id in self._pending_gets:
-                raise RuntimeError(f"duplicate GET transfer_id: {transfer_id}")
-            fields = data_parts.body["fields"]
-            global_indexes = data_parts.body["global_indexes"]
-            with limit_pytorch_auto_parallel_threads(
-                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get_prepare"
-            ):
-                result_data = self.storage_data.get_data(fields, global_indexes)
-                encoded_frames = tuple(encode(result_data))
-            payload_bytes = calc_packed_size(encoded_frames)
-            descriptor = PayloadDescriptor(
-                transfer_id=transfer_id,
-                payload_bytes=payload_bytes,
-                frame_sizes=tuple(memoryview(frame).nbytes for frame in encoded_frames),
-            )
-            descriptor.validate()
-            self._pending_gets[descriptor.transfer_id] = _PendingGet(
-                descriptor=descriptor,
-                sender_id=data_parts.sender_id,
-                frames=encoded_frames,
-            )
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.GET_DATA_READY,
-                sender_id=self.storage_unit_id,
-                body={"descriptor": descriptor.to_dict()},
-            )
-        except Exception as e:
-            return self._payload_transfer_error(f"GET prepare failed: {e}")
-
-    def _handle_get_commit(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """Start a GET send after the requester has posted its receive."""
-        transfer_id = data_parts.body["transfer_id"]
-        try:
-            pending = self._pending_gets.get(transfer_id)
-            if pending is None:
-                raise RuntimeError(f"unknown or expired GET transfer_id: {transfer_id}")
-            if pending.sender_id != data_parts.sender_id:
-                raise RuntimeError(f"GET transfer {transfer_id} belongs to another sender")
-            self._pending_gets.pop(transfer_id)
-            if self.payload_transfer is None:
-                raise RuntimeError("payload transfer is unavailable")
-
-            # Do not acknowledge GET before the payload send completes.  If
-            # the send failed after an early response, the requester could
-            # wait forever on its receive future with no control-plane error.
-            endpoint = TransferEndpoint.from_dict(data_parts.body["receiver_endpoint"])
-            token = ReceiveToken.from_dict(data_parts.body["receive_token"])
-            self.payload_transfer.send(endpoint, token, pending.descriptor, pending.frames).result()
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.GET_DATA_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"transfer_id": transfer_id},
-            )
-        except Exception as e:
-            return self._payload_transfer_error(f"GET commit failed: {e}")
-
-    def _handle_get_cancel(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """Discard a prepared GET before its send has started."""
-        transfer_id = data_parts.body["transfer_id"]
-        pending = self._pending_gets.get(transfer_id)
-        if pending is not None and pending.sender_id != data_parts.sender_id:
-            return self._payload_transfer_error(f"GET transfer {transfer_id} belongs to another sender")
-        self._pending_gets.pop(transfer_id, None)
-        return ZMQMessage.create(
-            request_type=ZMQRequestType.GET_DATA_RESPONSE,
-            sender_id=self.storage_unit_id,
-            body={"transfer_id": transfer_id},
-        )
 
     def _put_decoded_data(self, global_indexes: list[int], field_data: dict[str, Any], data_parser: Any) -> None:
         """Validate parsed data and store it."""
@@ -654,13 +398,6 @@ class SimpleStorageUnit:
             return len(value)
         except Exception:
             return None
-
-    def _payload_transfer_error(self, message: str) -> ZMQMessage:
-        return ZMQMessage.create(
-            request_type=ZMQRequestType.PUT_GET_ERROR,
-            sender_id=self.storage_unit_id,
-            body={"message": message},
-        )
 
     def _handle_clear(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
@@ -930,9 +667,7 @@ class SimpleStorageUnit:
 
     def get_payload_transfer_info(self) -> dict[str, Any] | None:
         """Return bootstrap-safe transfer endpoint metadata."""
-        if self.payload_transfer is None:
+        info = self.payload_transfer.bootstrap_info()
+        if info is None:
             return None
-        return {
-            "id": self.storage_unit_id,
-            "endpoint": self.payload_transfer.endpoint().to_dict(),
-        }
+        return {"id": self.storage_unit_id, **info}

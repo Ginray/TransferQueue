@@ -13,14 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Optional out-of-band payload transfer for SimpleStorage."""
+"""Payload transfer strategies for SimpleStorage."""
 
 from transfer_queue.storage.payload_transfer.base import (
-    PayloadDescriptor,
     PayloadTransfer,
     PayloadTransferError,
-    ReceiveToken,
-    TransferEndpoint,
 )
 from transfer_queue.storage.payload_transfer.factory import (
     create_payload_transfer,
@@ -28,11 +25,8 @@ from transfer_queue.storage.payload_transfer.factory import (
 )
 
 __all__ = [
-    "PayloadDescriptor",
     "PayloadTransfer",
     "PayloadTransferError",
-    "ReceiveToken",
-    "TransferEndpoint",
     "create_payload_transfer",
     "parse_payload_transfer_config",
 ]
