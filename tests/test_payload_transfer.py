@@ -172,7 +172,13 @@ def test_payload_transfer_config_extracts_ucx_settings():
             "backend": "nixl-ucx",
             "ucx_env_vars": {"UCX_TLS": "rc", "UCX_IB_GID_INDEX": 3},
         }
-    ) == ("nixl-ucx", {"UCX_TLS": "rc", "UCX_IB_GID_INDEX": 3})
+    ) == ("nixl-ucx", {"ucx_env_vars": {"UCX_TLS": "rc", "UCX_IB_GID_INDEX": 3}})
+
+
+def test_payload_transfer_config_preserves_backend_options():
+    assert parse_payload_transfer_config(
+        {"backend": "nixl-ucx", "device_id": 0, "something": "value"}
+    ) == ("nixl-ucx", {"device_id": 0, "something": "value"})
 
 
 def test_public_config_defaults_to_zmq_payload_transfer():

@@ -20,7 +20,6 @@ import ray
 from omegaconf import DictConfig
 
 from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
-from transfer_queue.storage.payload_transfer import parse_payload_transfer_config
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
 from transfer_queue.utils.common import get_node_round_robin_scheduling_strategies
 from transfer_queue.utils.logging_utils import get_logger
@@ -36,10 +35,7 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     simple_storage_handles = {}
     num_data_storage_units = conf.backend.SimpleStorage.num_data_storage_units
     total_storage_size = conf.backend.SimpleStorage.get("total_storage_size", None)
-    payload_transfer_backend, ucx_env_vars = parse_payload_transfer_config(
-        conf.backend.SimpleStorage.get("payload_transfer")
-    )
-    payload_transfer_config = {"backend": payload_transfer_backend, "ucx_env_vars": ucx_env_vars}
+    payload_transfer_config = conf.backend.SimpleStorage.get("payload_transfer")
     scheduling_strategies = get_node_round_robin_scheduling_strategies(num_data_storage_units)
 
     # Compute per-unit capacity: None means unlimited

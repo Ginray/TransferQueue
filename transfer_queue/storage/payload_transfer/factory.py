@@ -28,13 +28,13 @@ def parse_payload_transfer_config(value: object | None = None) -> tuple[str, dic
     if not isinstance(config, Mapping):
         raise TypeError("SimpleStorage.payload_transfer must be a mapping")
 
-    backend = str(config["backend"]).strip().lower()
+    config = dict(config)
+    if "backend" not in config:
+        raise ValueError("SimpleStorage.payload_transfer.backend is required")
+    backend = str(config.pop("backend")).strip().lower()
     if backend not in _SUPPORTED_TRANSFERS:
         raise ValueError(f"unsupported SimpleStorage payload transfer: {backend!r}; expected 'zmq' or 'nixl-ucx'")
-    ucx_env_vars = config.get("ucx_env_vars", {})
-    if not isinstance(ucx_env_vars, Mapping):
-        raise TypeError("SimpleStorage.payload_transfer.ucx_env_vars must be a mapping")
-    return backend, dict(ucx_env_vars)
+    return backend, config
 
 
 def create_payload_transfer(
@@ -43,7 +43,7 @@ def create_payload_transfer(
     peer_infos: Mapping[str, object] | None = None,
 ) -> PayloadTransfer:
     """Create the configured SimpleStorage payload transfer strategy."""
-    backend, ucx_env_vars = parse_payload_transfer_config(value)
+    backend, options = parse_payload_transfer_config(value)
     if backend == "zmq":
         from transfer_queue.storage.payload_transfer.zmq import ZmqPayloadTransfer
 
@@ -51,6 +51,12 @@ def create_payload_transfer(
     if backend == "nixl-ucx":
         from transfer_queue.storage.payload_transfer.nixl import NixlPayloadTransfer
 
-        return NixlPayloadTransfer(ucx_env_vars=ucx_env_vars, peer_infos=peer_infos)
+        ucx_env_vars = options.get("ucx_env_vars")
+        if ucx_env_vars is not None and not isinstance(ucx_env_vars, Mapping):
+            raise TypeError("SimpleStorage.payload_transfer.ucx_env_vars must be a mapping")
+        return NixlPayloadTransfer(
+            ucx_env_vars=None if ucx_env_vars is None else dict(ucx_env_vars),
+            peer_infos=peer_infos,
+        )
 
     raise RuntimeError(f"unhandled SimpleStorage payload transfer: {backend!r}")
