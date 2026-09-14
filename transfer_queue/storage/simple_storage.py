@@ -641,11 +641,11 @@ class SimpleStorageUnit:
         if zmq_context:
             zmq_context.term()
 
-        # Wait for threads to finish (with timeout)
+        # Finish in-flight requests before releasing payload-transfer resources.
         if worker_thread and worker_thread.is_alive():
-            worker_thread.join(timeout=5)
+            worker_thread.join()
         if proxy_thread and proxy_thread.is_alive():
-            proxy_thread.join(timeout=5)
+            proxy_thread.join()
 
         payload_transfer.close()
 
@@ -686,3 +686,14 @@ class SimpleStorageUnit:
         if info is None:
             return None
         return {"id": self.storage_unit_id, **info}
+
+    def reset_payload_timing(self) -> None:
+        """Clear optional payload-transfer timing samples."""
+        reset = getattr(self.payload_transfer, "reset_payload_timing", None)
+        if reset is not None:
+            reset()
+
+    def get_payload_timing(self) -> dict[str, list[float]]:
+        """Return optional payload-transfer timing samples."""
+        get_timing = getattr(self.payload_transfer, "get_payload_timing", None)
+        return get_timing() if get_timing is not None else {}

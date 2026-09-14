@@ -22,10 +22,13 @@ import os
 import socket
 import threading
 import time
+import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
+
+import numpy as np
 
 from transfer_queue.storage.payload_transfer.base import PayloadTransferError
 from transfer_queue.utils.logging_utils import get_logger
@@ -44,6 +47,8 @@ class NixlError(PayloadTransferError):
 class _RegisteredReceiveBuffer:
     buffer: bytearray
     registrations: Any
+    address: int
+    lease_finalizer: weakref.finalize | None = None
 
     @property
     def capacity(self) -> int:
@@ -57,11 +62,11 @@ class _ReceiveState:
 
 
 @dataclass
-class _FrameRegistration:
-    """One registered source frame kept alive for an active transfer."""
+class _FrameSource:
+    """One source frame kept alive for an active transfer."""
 
-    owner: bytearray | memoryview
-    registrations: Any
+    owner: bytearray | memoryview | np.ndarray
+    registration: Any | None
     address: int
     size: int
 
@@ -101,8 +106,14 @@ class NixlRuntime:
     for the sender-side NIXL request to finish.
     """
 
-    def __init__(self, ucx_env_vars: dict[str, object] | None = None):
+    def __init__(
+        self,
+        ucx_env_vars: dict[str, object] | None = None,
+        timing_callback: Callable[[str, float], None] | None = None,
+        max_cached_receive_buffers: int = 1,
+    ):
         _configure_ucx_environment(ucx_env_vars)
+        self._timing_callback = timing_callback
         try:
             from nixl import nixl_agent, nixl_agent_config
         except Exception as exc:  # pragma: no cover - optional dependency
@@ -122,6 +133,7 @@ class NixlRuntime:
 
         if "UCX" not in getattr(self._agent, "backends", {}):
             raise NixlError("NIXL UCX backend is not available")
+        self._endpoint_metadata = self._agent.get_agent_metadata()
 
         _warn_if_tcp_fallback_possible()
         logger.info(
@@ -132,12 +144,19 @@ class NixlRuntime:
         )
 
         self._receives: dict[str, _ReceiveState] = {}
-        self._reusable_receive_buffer: _RegisteredReceiveBuffer | None = None
+        self._receive_pool: list[_RegisteredReceiveBuffer] = []
+        self._max_cached_receive_buffers = max(1, max_cached_receive_buffers)
+        self._leased_receive_buffers: dict[int, _RegisteredReceiveBuffer] = {}
+        self._failed_deregistrations: list[tuple[Any, Any]] = []
         self._remote_metadata: dict[str, bytes] = {}
         self._lock = threading.RLock()
         self._closed = False
         self._timeout_seconds = DEFAULT_NIXL_TRANSFER_TIMEOUT_SECONDS
         self._send_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tq-nixl-send")
+
+    def _record_timing(self, name: str, start: float) -> None:
+        if self._timing_callback is not None:
+            self._timing_callback(name, time.perf_counter() - start)
 
     @staticmethod
     def _make_agent_name() -> str:
@@ -149,10 +168,10 @@ class NixlRuntime:
         return self._agent_name
 
     def endpoint_metadata(self) -> bytes:
-        """Return serialized metadata that peers need to address this agent."""
+        """Return stable connection metadata; receive MRs use partial metadata."""
         with self._lock:
             self._ensure_open()
-            return self._agent.get_agent_metadata()
+            return self._endpoint_metadata
 
     def prepare_receive(self, descriptor: Any) -> dict[str, Any]:
         """Allocate or reuse registered storage for a scatter receive."""
@@ -163,10 +182,13 @@ class NixlRuntime:
             self._ensure_open()
             if descriptor.transfer_id in self._receives:
                 raise NixlError(f"duplicate NIXL receive: {descriptor.transfer_id}")
+            receive_start = time.perf_counter()
             scratch = self._acquire_receive_buffer(descriptor.payload_bytes)
+            self._record_timing("receive_buffer_prepare", receive_start)
             try:
+                descriptor_start = time.perf_counter()
                 initialize_packed_frame_table(scratch.buffer, descriptor.frame_sizes)
-                address = _buffer_address(scratch.buffer)
+                address = scratch.address
                 payload_offset = 4 + 8 * len(descriptor.frame_sizes)
                 regions = []
                 for size in descriptor.frame_sizes:
@@ -174,8 +196,13 @@ class NixlRuntime:
                         regions.append((address + payload_offset, size, 0))
                     payload_offset += size
                 frame_descs = self._agent.get_serialized_descs(self._agent.get_xfer_descs(regions, mem_type="DRAM"))
+                self._record_timing("receive_descriptor_prepare", descriptor_start)
                 state = _ReceiveState(scratch, frame_descs)
-                metadata = self._agent.get_agent_metadata()
+                metadata = self._agent.get_partial_agent_metadata(
+                    scratch.registrations,
+                    inc_conn_info=True,
+                    backends=["UCX"],
+                )
                 self._receives[descriptor.transfer_id] = state
             except Exception as exc:
                 self._return_receive_buffer(scratch)
@@ -218,47 +245,80 @@ class NixlRuntime:
             )
 
     def _acquire_receive_buffer(self, required_capacity: int) -> _RegisteredReceiveBuffer:
-        reusable = self._reusable_receive_buffer
-        if reusable is not None and reusable.capacity >= required_capacity:
-            self._reusable_receive_buffer = None
-            return reusable
+        reusable = [
+            (scratch.capacity, index)
+            for index, scratch in enumerate(self._receive_pool)
+            if scratch.capacity >= required_capacity
+        ]
+        if reusable:
+            _, index = min(reusable)
+            return self._receive_pool.pop(index)
 
+        allocation_start = time.perf_counter()
         buffer = bytearray(required_capacity)
+        self._record_timing("receive_buffer_allocation", allocation_start)
         address = _buffer_address(buffer)
+        registration_start = time.perf_counter()
         registrations = self._agent.register_memory(
             [(address, required_capacity, 0, "")], mem_type="DRAM", backends=["UCX"]
         )
+        self._record_timing("receive_buffer_registration", registration_start)
         if registrations is None:
             raise NixlError("failed to register NIXL receive scratch buffer")
-        allocated = _RegisteredReceiveBuffer(buffer, registrations)
-        if reusable is not None:
-            self._reusable_receive_buffer = None
-            self._deregister_registration(reusable.registrations)
-        return allocated
+        return _RegisteredReceiveBuffer(buffer, registrations, address)
 
     def _return_receive_buffer(self, scratch: _RegisteredReceiveBuffer) -> None:
-        reusable = self._reusable_receive_buffer
-        if reusable is None:
-            self._reusable_receive_buffer = scratch
-        elif scratch.capacity > reusable.capacity:
-            self._deregister_registration(reusable.registrations)
-            self._reusable_receive_buffer = scratch
+        scratch.lease_finalizer = None
+        if self._closed:
+            self._deregister_registration(scratch.registrations, scratch)
+        elif len(self._receive_pool) < self._max_cached_receive_buffers:
+            self._receive_pool.append(scratch)
         else:
-            self._deregister_registration(scratch.registrations)
+            smallest_index = min(range(len(self._receive_pool)), key=lambda index: self._receive_pool[index].capacity)
+            if scratch.capacity <= self._receive_pool[smallest_index].capacity:
+                self._deregister_registration(scratch.registrations, scratch)
+                return
+            evicted = self._receive_pool[smallest_index]
+            self._receive_pool[smallest_index] = scratch
+            self._deregister_registration(evicted.registrations, evicted)
 
-    def _acquire_frame_registration(self, frame: bytes | bytearray | memoryview) -> _FrameRegistration:
+    def _release_receive_buffer(self, scratch: _RegisteredReceiveBuffer) -> None:
+        with self._lock:
+            if self._leased_receive_buffers.pop(id(scratch), None) is not None:
+                self._return_receive_buffer(scratch)
+
+    def _prepare_frame_source(self, frame: bytes | bytearray | memoryview) -> _FrameSource:
         view = memoryview(frame)
-        if view.readonly or not view.c_contiguous:
-            owner: bytearray | memoryview = bytearray(view)
+        if not view.c_contiguous:
+            copy_start = time.perf_counter()
+            owner: bytearray | memoryview | np.ndarray = bytearray(view)
+            self._record_timing("send_source_copy", copy_start)
+            address = _buffer_address(owner)
+        elif view.readonly:
+            owner = np.frombuffer(view, dtype=np.uint8, count=view.nbytes)
+            address = int(owner.ctypes.data)
         else:
             owner = view.cast("B")
-        address = _buffer_address(owner)
+            address = _buffer_address(owner)
+
+        size = memoryview(owner).nbytes
+        if self._is_leased_receive_range(address, size):
+            return _FrameSource(owner, None, address, size)
+
+        registration_start = time.perf_counter()
         registrations = self._agent.register_memory(
-            [(address, memoryview(owner).nbytes, 0, "")], mem_type="DRAM", backends=["UCX"]
+            [(address, size, 0, "")], mem_type="DRAM", backends=["UCX"]
         )
+        self._record_timing("send_source_registration", registration_start)
         if registrations is None:
             raise NixlError("failed to register NIXL source frame")
-        return _FrameRegistration(owner, registrations, address, memoryview(owner).nbytes)
+        return _FrameSource(owner, registrations, address, size)
+
+    def _is_leased_receive_range(self, address: int, size: int) -> bool:
+        return any(
+            scratch.address <= address and address + size <= scratch.address + scratch.capacity
+            for scratch in self._leased_receive_buffers.values()
+        )
 
     def _send_scatter(
         self,
@@ -268,7 +328,7 @@ class NixlRuntime:
         serialized_remote_descs: bytes,
     ) -> None:
         """Send frames directly to matching registered remote regions."""
-        frame_registrations: list[_FrameRegistration] = []
+        frame_sources: list[_FrameSource] = []
         handle = None
         try:
             with self._lock:
@@ -277,6 +337,7 @@ class NixlRuntime:
                 if previous != metadata:
                     if previous is not None:
                         self._agent.remove_remote_agent(remote_name)
+                        self._remote_metadata.pop(remote_name, None)
                     loaded_name = self._agent.add_remote_agent(metadata)
                     if isinstance(loaded_name, bytes):
                         loaded_name = loaded_name.decode()
@@ -286,15 +347,20 @@ class NixlRuntime:
                         )
                     self._remote_metadata[remote_name] = metadata
 
+                source_registration_start = time.perf_counter()
                 for frame in frames:
                     if memoryview(frame).nbytes:
-                        frame_registrations.append(self._acquire_frame_registration(frame))
+                        frame_sources.append(self._prepare_frame_source(frame))
+                self._record_timing("send_source_registration_total", source_registration_start)
                 local_descs = self._agent.get_xfer_descs(
-                    [(registration.address, registration.size, 0) for registration in frame_registrations],
+                    [(source.address, source.size, 0) for source in frame_sources],
                     mem_type="DRAM",
                 )
                 remote_descs = self._agent.deserialize_descs(serialized_remote_descs)
+                initialize_start = time.perf_counter()
                 handle = self._agent.initialize_xfer("WRITE", local_descs, remote_descs, remote_name, backends=["UCX"])
+                self._record_timing("ucx_transfer_initialize", initialize_start)
+                transfer_start = time.perf_counter()
                 status = self._agent.transfer(handle)
 
             deadline = time.monotonic() + self._timeout_seconds
@@ -308,19 +374,32 @@ class NixlRuntime:
                     time.sleep(0.0005)
             if status != "DONE":
                 raise NixlError(f"NIXL WRITE failed with status {status!r}")
+            self._record_timing("ucx_transfer_wait", transfer_start)
         except NixlError:
             raise
         except Exception as exc:
             raise NixlError(f"NIXL H2H scatter WRITE failed: {exc}") from exc
         finally:
+            if handle is not None:
+                self._finish_transfer(handle)
             with self._lock:
-                if handle is not None:
-                    try:
-                        self._agent.release_xfer_handle(handle)
-                    except Exception as exc:
-                        logger.warning("failed to release NIXL transfer handle: %s", exc)
-                for registration in frame_registrations:
-                    self._deregister_registration(registration.registrations)
+                for source in frame_sources:
+                    if source.registration is not None:
+                        self._deregister_registration(source.registration, source)
+
+    def _finish_transfer(self, handle: Any) -> None:
+        """Do not release source MRs until NIXL accepts request cleanup."""
+        warned = False
+        while True:
+            try:
+                with self._lock:
+                    self._agent.release_xfer_handle(handle)
+                return
+            except Exception as exc:
+                if not warned:
+                    logger.warning("NIXL transfer cleanup is pending; waiting before releasing its memory: %s", exc)
+                    warned = True
+                time.sleep(0.01)
 
     @staticmethod
     def _validate_send_metadata(
@@ -339,7 +418,7 @@ class NixlRuntime:
         return remote_name, metadata
 
     def receive(self, descriptor: Any) -> Future[memoryview]:
-        """Complete a prepared receive and return detached packed payload bytes."""
+        """Complete a receive and lease its registered buffer to the decoded payload."""
         descriptor.validate()
         future: Future[memoryview] = Future()
         with self._lock:
@@ -349,21 +428,30 @@ class NixlRuntime:
                 future.set_exception(NixlError(f"no prepared NIXL receive for {descriptor.transfer_id}"))
                 return future
             try:
-                payload = state.scratch.buffer[: descriptor.payload_bytes]
-                future.set_result(memoryview(payload))
+                lease_start = time.perf_counter()
+                # Decoded tensors retain this NumPy exporter through the buffer protocol.
+                # Its finalizer prevents reuse while stored or returned data is still alive.
+                owner = np.frombuffer(state.scratch.buffer, dtype=np.uint8, count=descriptor.payload_bytes)
+                state.scratch.lease_finalizer = weakref.finalize(
+                    owner,
+                    self._release_receive_buffer,
+                    state.scratch,
+                )
+                self._leased_receive_buffers[id(state.scratch)] = state.scratch
+                future.set_result(memoryview(owner))
+                self._record_timing("receive_payload_lease", lease_start)
             except Exception as exc:
-                future.set_exception(NixlError(f"failed to copy NIXL receive payload: {exc}"))
-            finally:
                 self._return_receive_buffer(state.scratch)
+                future.set_exception(NixlError(f"failed to lease NIXL receive payload: {exc}"))
         return future
 
     def cancel_receive(self, transfer_id: str) -> None:
-        """Cancel a prepared receive and deregister its scratch buffer."""
+        """Cancel a prepared receive and return its registered buffer to the pool."""
         with self._lock:
             state = self._receives.pop(transfer_id, None)
             if state is None:
                 return
-            self._deregister_registration(state.scratch.registrations)
+            self._return_receive_buffer(state.scratch)
 
     def close(self) -> None:
         """Stop the send executor and release all NIXL registrations."""
@@ -373,20 +461,33 @@ class NixlRuntime:
             self._closed = True
         self._send_executor.shutdown(wait=True, cancel_futures=True)
         with self._lock:
-            for state in self._receives.values():
-                self._deregister_registration(state.scratch.registrations)
+            buffers = list(self._receive_pool)
+            prepared_buffers = [state.scratch for state in self._receives.values()]
+            for scratch in self._leased_receive_buffers.values():
+                if scratch.lease_finalizer is not None:
+                    scratch.lease_finalizer.detach()
+                buffers.append(scratch)
+            for scratch in buffers:
+                self._deregister_registration(scratch.registrations, scratch)
+            self._receive_pool.clear()
             self._receives.clear()
-            if self._reusable_receive_buffer is not None:
-                self._deregister_registration(self._reusable_receive_buffer.registrations)
-                self._reusable_receive_buffer = None
-        self._agent = None
+            self._leased_receive_buffers.clear()
+            failed_deregistrations = self._failed_deregistrations
+            self._failed_deregistrations = []
+            agent = self._agent
+            self._agent = None
+        # Agent teardown owns prepared MRs because a remote WRITE may still refer to them.
+        del agent
+        del prepared_buffers
+        del failed_deregistrations
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise NixlError("NIXL runtime is closed")
 
-    def _deregister_registration(self, registrations: Any) -> None:
+    def _deregister_registration(self, registrations: Any, owner: Any) -> None:
         try:
             self._agent.deregister_memory(registrations, backends=["UCX"])
         except Exception as exc:
             logger.warning("failed to deregister NIXL memory: %s", exc)
+            self._failed_deregistrations.append((owner, registrations))
