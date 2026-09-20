@@ -2,6 +2,8 @@
 
 After setting `payload_transfer` to `nixl-ucx`, all non-empty payloads are transferred through NIXL-UCX;
 ZMQ handles control messages only. This document describes the configuration and usage.
+See [NIXL-UCX SimpleStorage Host Payload Fast Path](nixl_ucx_payload_lifecycle.md) for the complete data path,
+buffer ownership, and cleanup semantics.
 
 ## 1. Check RDMA Devices
 
