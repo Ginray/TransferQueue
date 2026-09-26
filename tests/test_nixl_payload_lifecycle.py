@@ -46,6 +46,7 @@ class _FakeAgent:
         self.backends = {"UCX": object()}
         self.register_calls: list[Any] = []
         self.deregister_calls: list[Any] = []
+        self.events: list[str] = []
         self.add_remote_calls: list[bytes] = []
         self.remove_remote_calls: list[str] = []
         self.transfer_calls: list[Any] = []
@@ -60,11 +61,13 @@ class _FakeAgent:
         return f"metadata-{len(self.register_calls)}".encode()
 
     def register_memory(self, regions: Any, **kwargs: Any) -> tuple[str, int]:
+        self.events.append("register")
         self.register_calls.append(regions)
         self._registration_id += 1
         return ("registration", self._registration_id)
 
     def deregister_memory(self, registration: Any, **kwargs: Any) -> None:
+        self.events.append("deregister")
         if self.deregister_error:
             raise RuntimeError("deregister failed")
         self.deregister_calls.append(registration)
@@ -191,7 +194,7 @@ def test_receive_frames_decode_without_copy_and_lease_until_last_tensor(runtime)
     assert instance._idle_receive_buffers == [scratch]
 
 
-def test_receive_pool_uses_first_usable_buffer_without_deregistering(runtime):
+def test_receive_pool_reuses_an_idle_buffer_that_fits(runtime):
     instance, agent = runtime
     first = _descriptor("first", 16)
     second = _descriptor("second", 8)
@@ -204,6 +207,66 @@ def test_receive_pool_uses_first_usable_buffer_without_deregistering(runtime):
     assert instance._receives["second"] is first_buffer
     assert len(agent.register_calls) == 1
     assert agent.deregister_calls == []
+    assert instance.diagnostics["receive_buffer_acquisitions"] == 2
+    assert instance.diagnostics["receive_buffer_registrations"] == 1
+    assert instance.diagnostics["receive_buffer_reuses"] == 1
+
+
+def test_receive_pool_best_fit_prefers_smallest_sufficient_idle_buffer(runtime):
+    instance, agent = runtime
+    smaller = _descriptor("smaller", 16)
+    larger = _descriptor("larger", 64)
+
+    instance.prepare_receive(smaller)
+    smaller_buffer = instance._receives[smaller.transfer_id]
+    instance.prepare_receive(larger)
+    larger_buffer = instance._receives[larger.transfer_id]
+    instance.cancel_receive(smaller.transfer_id)
+    instance.cancel_receive(larger.transfer_id)
+
+    request = _descriptor("request", 8)
+    instance.prepare_receive(request)
+
+    assert instance._receives[request.transfer_id] is smaller_buffer
+    assert instance._receives[request.transfer_id] is not larger_buffer
+    assert len(agent.register_calls) == 2
+    assert agent.deregister_calls == []
+    assert instance.diagnostics["receive_buffer_reuses"] == 1
+
+
+def test_receive_pool_evicts_oldest_idle_before_registering_on_miss(runtime):
+    instance, agent = runtime
+    leased = _descriptor("leased", 16)
+    instance.prepare_receive(leased)
+    leased_buffer = instance._receives[leased.transfer_id]
+    held_frames = instance.receive(leased).result()
+
+    undersized = _descriptor("undersized", 8)
+    instance.prepare_receive(undersized)
+    undersized_buffer = instance._receives[undersized.transfer_id]
+
+    larger_idle = _descriptor("larger_idle", 24)
+    instance.prepare_receive(larger_idle)
+    larger_idle_buffer = instance._receives[larger_idle.transfer_id]
+    instance.cancel_receive(undersized.transfer_id)
+    instance.cancel_receive(larger_idle.transfer_id)
+
+    request = _descriptor("request", 32)
+    instance.prepare_receive(request)
+
+    assert instance._leased_receive_buffers[id(leased_buffer)] is leased_buffer
+    assert instance._receives[request.transfer_id].capacity == 32
+    assert agent.deregister_calls == [undersized_buffer.registration]
+    assert agent.events[-2:] == ["deregister", "register"]
+    assert instance._idle_receive_buffers == [larger_idle_buffer]
+    assert instance.diagnostics["registered_bytes"] == 16 + 24 + 32
+    assert instance.diagnostics["receive_buffer_acquisitions"] == 4
+    assert instance.diagnostics["receive_buffer_registrations"] == 4
+    assert instance.diagnostics["receive_buffer_reuses"] == 0
+    assert instance.diagnostics["receive_buffer_evictions"] == 1
+
+    instance.cancel_receive(request.transfer_id)
+    del held_frames
 
 
 def test_sources_reuse_leased_mr_and_external_registration_is_transfer_scoped(runtime):
