@@ -234,7 +234,48 @@ def test_receive_pool_best_fit_prefers_smallest_sufficient_idle_buffer(runtime):
     assert instance.diagnostics["receive_buffer_reuses"] == 1
 
 
-def test_receive_pool_evicts_oldest_idle_before_registering_on_miss(runtime):
+def test_receive_pool_tracks_pending_and_leased_working_set(runtime):
+    instance, _ = runtime
+    leased = _descriptor("leased", 16)
+    pending = _descriptor("pending", 24)
+
+    instance.prepare_receive(leased)
+    held_frames = instance.receive(leased).result()
+    instance.prepare_receive(pending)
+
+    diagnostics = instance.diagnostics
+    assert diagnostics["receive_working_set_hwm_count"] == 2
+    assert diagnostics["receive_working_set_hwm_bytes"] == 40
+
+    instance.cancel_receive(pending.transfer_id)
+    del held_frames
+    gc.collect()
+
+
+def test_receive_pool_bytes_budget_trims_extra_idle_capacity(runtime):
+    instance, agent = runtime
+    descriptors = [_descriptor(f"small-{index}", 8) for index in range(3)]
+
+    for descriptor in descriptors:
+        instance.prepare_receive(descriptor)
+    registrations = [instance._receives[descriptor.transfer_id].registration for descriptor in descriptors]
+    for descriptor in descriptors:
+        instance.cancel_receive(descriptor.transfer_id)
+
+    assert instance.diagnostics["receive_working_set_hwm_count"] == 3
+    assert instance.diagnostics["receive_working_set_hwm_bytes"] == 24
+    assert len(instance._idle_receive_buffers) == 3
+
+    request = _descriptor("larger", 16)
+    instance.prepare_receive(request)
+
+    assert agent.deregister_calls == registrations[:2]
+    assert len(instance._idle_receive_buffers) == 1
+    assert instance.diagnostics["registered_bytes"] == 24
+    assert instance.diagnostics["receive_buffer_evictions"] == 2
+
+
+def test_receive_pool_evicts_idle_before_registering_on_miss(runtime):
     instance, agent = runtime
     leased = _descriptor("leased", 16)
     instance.prepare_receive(leased)
@@ -256,14 +297,19 @@ def test_receive_pool_evicts_oldest_idle_before_registering_on_miss(runtime):
 
     assert instance._leased_receive_buffers[id(leased_buffer)] is leased_buffer
     assert instance._receives[request.transfer_id].capacity == 32
-    assert agent.deregister_calls == [undersized_buffer.registration]
-    assert agent.events[-2:] == ["deregister", "register"]
-    assert instance._idle_receive_buffers == [larger_idle_buffer]
-    assert instance.diagnostics["registered_bytes"] == 16 + 24 + 32
+    assert agent.deregister_calls == [
+        undersized_buffer.registration,
+        larger_idle_buffer.registration,
+    ]
+    assert agent.events[-3:] == ["deregister", "deregister", "register"]
+    assert instance._idle_receive_buffers == []
+    assert instance.diagnostics["registered_bytes"] == 16 + 32
+    assert instance.diagnostics["receive_working_set_hwm_count"] == 3
+    assert instance.diagnostics["receive_working_set_hwm_bytes"] == 48
     assert instance.diagnostics["receive_buffer_acquisitions"] == 4
     assert instance.diagnostics["receive_buffer_registrations"] == 4
     assert instance.diagnostics["receive_buffer_reuses"] == 0
-    assert instance.diagnostics["receive_buffer_evictions"] == 1
+    assert instance.diagnostics["receive_buffer_evictions"] == 2
 
     instance.cancel_receive(request.transfer_id)
     del held_frames
@@ -465,6 +511,12 @@ def test_quarantine_never_returns_exposed_receiver_to_pool(runtime):
     assert instance._idle_receive_buffers == []
     assert instance._quarantined_receive_buffers == [scratch]
     assert instance.diagnostics["quarantined_bytes"] == 32
+
+    safe = _descriptor("safe", 8)
+    instance.prepare_receive(safe)
+    assert instance.diagnostics["receive_working_set_hwm_count"] == 1
+    assert instance.diagnostics["receive_working_set_hwm_bytes"] == 32
+    assert instance.diagnostics["registered_bytes"] == 40
 
 
 def test_get_commit_returns_deferred_response_and_maps_completion():

@@ -163,7 +163,8 @@ class NixlRuntime:
         self._closed = False
         self._timeout_seconds = DEFAULT_NIXL_TRANSFER_TIMEOUT_SECONDS
         self._trace_enabled = os.environ.get("TQ_NIXL_LIFECYCLE_TRACE") == "1"
-        self._max_idle_receive_buffers = 0
+        self._receive_working_set_hwm_count = 0
+        self._receive_working_set_hwm_bytes = 0
         self._registered_bytes = 0
         self._quarantined_bytes = 0
         self._receive_buffer_acquisitions = 0
@@ -205,7 +206,8 @@ class NixlRuntime:
                 "idle_receive_buffers": len(self._idle_receive_buffers),
                 "pending_receive_buffers": sum(buffer is not None for buffer in self._receives.values()),
                 "leased_receive_buffers": len(self._leased_receive_buffers),
-                "max_idle_receive_buffers": self._max_idle_receive_buffers,
+                "receive_working_set_hwm_count": self._receive_working_set_hwm_count,
+                "receive_working_set_hwm_bytes": self._receive_working_set_hwm_bytes,
                 "receive_buffer_acquisitions": self._receive_buffer_acquisitions,
                 "receive_buffer_registrations": self._receive_buffer_registrations,
                 "receive_buffer_reuses": self._receive_buffer_reuses,
@@ -257,11 +259,14 @@ class NixlRuntime:
                 self._receives[descriptor.transfer_id] = scratch
                 if scratch is not None:
                     self._receive_buffer_acquisitions += 1
-                active_receivers = sum(buffer is not None for buffer in self._receives.values())
-                active_receivers += len(self._leased_receive_buffers)
-                self._max_idle_receive_buffers = max(
-                    self._max_idle_receive_buffers, active_receivers
+                active_count, active_bytes = self._receive_working_set()
+                self._receive_working_set_hwm_count = max(
+                    self._receive_working_set_hwm_count, active_count
                 )
+                self._receive_working_set_hwm_bytes = max(
+                    self._receive_working_set_hwm_bytes, active_bytes
+                )
+                self._trim_idle_receive_buffers()
                 self._trace(
                     "receive_prepared",
                     transfer_id=descriptor.transfer_id,
@@ -404,6 +409,38 @@ class NixlRuntime:
             self._quarantined_bytes = 0
         retained_sources.clear()
 
+    def _receive_working_set(self) -> tuple[int, int]:
+        """Return count and bytes for pending plus leased receive buffers."""
+        pending = [scratch for scratch in self._receives.values() if scratch is not None]
+        return (
+            len(pending) + len(self._leased_receive_buffers),
+            sum(scratch.capacity for scratch in pending)
+            + sum(scratch.capacity for scratch in self._leased_receive_buffers.values()),
+        )
+
+    def _trim_idle_receive_buffers(
+        self,
+        *,
+        reserve_count: int = 0,
+        reserve_bytes: int = 0,
+    ) -> None:
+        """Trim idle receive buffers to the observed working-set budget."""
+        active_count, active_bytes = self._receive_working_set()
+        count_limit = max(
+            self._receive_working_set_hwm_count, active_count + reserve_count
+        )
+        bytes_limit = max(
+            self._receive_working_set_hwm_bytes, active_bytes + reserve_bytes
+        )
+        idle_bytes = sum(scratch.capacity for scratch in self._idle_receive_buffers)
+        while self._idle_receive_buffers and (
+            active_count + len(self._idle_receive_buffers) + reserve_count > count_limit
+            or active_bytes + idle_bytes + reserve_bytes > bytes_limit
+        ):
+            evicted_capacity = self._idle_receive_buffers[0].capacity
+            self._evict_oldest_receive_buffer()
+            idle_bytes -= evicted_capacity
+
     def _acquire_receive_buffer(self, required_capacity: int) -> _RegisteredReceiveBuffer:
         candidates = (
             (scratch.capacity, index)
@@ -422,9 +459,11 @@ class NixlRuntime:
             )
             return scratch
 
-        # A miss replaces one idle slot; only an empty pool grows with concurrency.
-        if self._idle_receive_buffers:
-            self._evict_oldest_receive_buffer()
+        # A miss replaces stale idle capacity before registering a new MR.
+        self._trim_idle_receive_buffers(
+            reserve_count=1,
+            reserve_bytes=required_capacity,
+        )
 
         buffer = bytearray(required_capacity)
         address = _buffer_address(buffer)
@@ -446,10 +485,9 @@ class NixlRuntime:
         return scratch
 
     def _return_receive_buffer(self, scratch: _RegisteredReceiveBuffer) -> None:
-        """Keep no more idle slots than the highest observed concurrent receives."""
+        """Return a released receive MR to the bounded idle pool."""
         self._idle_receive_buffers.append(scratch)
-        while len(self._idle_receive_buffers) > self._max_idle_receive_buffers:
-            self._evict_oldest_receive_buffer()
+        self._trim_idle_receive_buffers()
 
     def _evict_oldest_receive_buffer(self) -> None:
         oldest = self._idle_receive_buffers.pop(0)
