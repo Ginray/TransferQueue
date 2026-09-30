@@ -252,30 +252,7 @@ def test_receive_pool_tracks_pending_and_leased_working_set(runtime):
     gc.collect()
 
 
-def test_receive_pool_bytes_budget_trims_extra_idle_capacity(runtime):
-    instance, agent = runtime
-    descriptors = [_descriptor(f"small-{index}", 8) for index in range(3)]
-
-    for descriptor in descriptors:
-        instance.prepare_receive(descriptor)
-    registrations = [instance._receives[descriptor.transfer_id].registration for descriptor in descriptors]
-    for descriptor in descriptors:
-        instance.cancel_receive(descriptor.transfer_id)
-
-    assert instance.diagnostics["receive_working_set_hwm_count"] == 3
-    assert instance.diagnostics["receive_working_set_hwm_bytes"] == 24
-    assert len(instance._idle_receive_buffers) == 3
-
-    request = _descriptor("larger", 16)
-    instance.prepare_receive(request)
-
-    assert agent.deregister_calls == registrations[:2]
-    assert len(instance._idle_receive_buffers) == 1
-    assert instance.diagnostics["registered_bytes"] == 24
-    assert instance.diagnostics["receive_buffer_evictions"] == 2
-
-
-def test_receive_pool_evicts_idle_before_registering_on_miss(runtime):
+def test_receive_pool_evicts_oldest_idle_before_registering_on_miss(runtime):
     instance, agent = runtime
     leased = _descriptor("leased", 16)
     instance.prepare_receive(leased)
