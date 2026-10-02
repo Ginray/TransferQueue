@@ -20,6 +20,7 @@ import time
 import weakref
 from collections.abc import Mapping
 from concurrent.futures import Future
+from contextlib import ExitStack
 from queue import Empty, SimpleQueue
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any
@@ -82,6 +83,7 @@ def _drain_deferred_responses(
     completions: SimpleQueue[tuple[bytes, Future[ZMQMessage]]],
     worker_socket: zmq.Socket,
     storage_id: str,
+    measurements: dict[Future[ZMQMessage], ExitStack],
 ) -> None:
     """Send completed responses from the only thread that owns the ZMQ socket."""
     while True:
@@ -89,14 +91,15 @@ def _drain_deferred_responses(
             identity, future = completions.get_nowait()
         except Empty:
             return
-        try:
-            response = future.result()
-        except Exception as exc:
-            response = ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_GET_ERROR,
-                sender_id=storage_id,
-                body={"message": f"{storage_id}, deferred response failed: {exc}."},
-            )
+        with measurements.pop(future):
+            try:
+                response = future.result()
+            except Exception as exc:
+                response = ZMQMessage.create(
+                    request_type=ZMQRequestType.PUT_GET_ERROR,
+                    sender_id=storage_id,
+                    body={"message": f"{storage_id}, deferred response failed: {exc}."},
+                )
         worker_socket.send_multipart([identity] + response.serialize(), copy=False)
 
 
@@ -342,6 +345,7 @@ class SimpleStorageUnit:
         wakeup_fd = wakeup_reader.fileno()
         poller.register(wakeup_fd, zmq.POLLIN)
         deferred_completions: SimpleQueue[tuple[bytes, Future[ZMQMessage]]] = SimpleQueue()
+        deferred_measurements: dict[Future[ZMQMessage], ExitStack] = {}
 
         logger.info(f"[{self.storage_unit_id}]: worker thread started...")
         perf_monitor = IntervalPerfMonitor(caller_name=f"{self.storage_unit_id}")
@@ -368,7 +372,9 @@ class SimpleStorageUnit:
                 except BlockingIOError:
                     pass
                 try:
-                    _drain_deferred_responses(deferred_completions, worker_socket, self.storage_unit_id)
+                    _drain_deferred_responses(
+                        deferred_completions, worker_socket, self.storage_unit_id, deferred_measurements
+                    )
                 except zmq.ZMQError as exc:
                     logger.warning(f"[{self.storage_unit_id}]: deferred response send failed: {exc}")
                     break
@@ -391,21 +397,19 @@ class SimpleStorageUnit:
                         ZMQRequestType.PUT_DATA_COMMIT: "PUT_DATA",
                         ZMQRequestType.GET_DATA_COMMIT: "GET_DATA",
                     }.get(operation)
-                    if metric_op is not None:
-                        with monitor.measure(op_type=metric_op):
-                            response_msg = self.payload_transfer.handle_request(
-                                request_msg,
-                                storage_id=self.storage_unit_id,
-                                load_data=self._load_data,
-                                store_data=self._put_decoded_data,
-                            )
-                    else:
+                    with ExitStack() as measurement:
+                        if metric_op is not None:
+                            measurement.enter_context(monitor.measure(op_type=metric_op))
                         response_msg = self.payload_transfer.handle_request(
                             request_msg,
                             storage_id=self.storage_unit_id,
                             load_data=self._load_data,
                             store_data=self._put_decoded_data,
                         )
+                        if isinstance(response_msg, DeferredResponse):
+                            # Finish timing on this worker when the response is ready,
+                            # including queueing and payload transfer time.
+                            deferred_measurements[response_msg.future] = measurement.pop_all()
 
                     if response_msg is None and operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
                         with monitor.measure(op_type="CLEAR_DATA"):
@@ -451,6 +455,8 @@ class SimpleStorageUnit:
                     worker_socket.send_multipart([identity] + response_msg.serialize(), copy=False)
 
         logger.info(f"[{self.storage_unit_id}]: worker stopped.")
+        for measurement in deferred_measurements.values():
+            measurement.close()
         poller.unregister(wakeup_fd)
         poller.unregister(worker_socket)
         wakeup_reader.close()

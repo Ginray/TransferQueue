@@ -13,6 +13,7 @@ import threading
 import time
 import types
 from concurrent.futures import Future
+from contextlib import ExitStack
 from queue import SimpleQueue
 from typing import Any, Callable
 
@@ -761,6 +762,10 @@ def test_deferred_response_copies_identity_and_worker_sends_once():
     shutdown = threading.Event()
     identity = bytearray(b"client-a")
     worker = _CapturingSocket()
+    timing_finished: list[bool] = []
+    measurement = ExitStack()
+    measurement.callback(timing_finished.append, True)
+    measurements = {future: measurement}
     try:
         _queue_deferred_response(identity, response, completions, writer, shutdown)
         identity[:] = b"client-b"
@@ -769,11 +774,14 @@ def test_deferred_response_copies_identity_and_worker_sends_once():
         )
         assert dict(poller.poll(1000))[reader.fileno()] == zmq.POLLIN
         assert reader.recv(1) == b"\0"
-        _drain_deferred_responses(completions, worker, "storage")
-        _drain_deferred_responses(completions, worker, "storage")
+        assert timing_finished == []
+        _drain_deferred_responses(completions, worker, "storage", measurements)
+        _drain_deferred_responses(completions, worker, "storage", measurements)
     finally:
         reader.close()
         writer.close()
 
     assert len(worker.messages) == 1
     assert worker.messages[0][0] == b"client-a"
+    assert timing_finished == [True]
+    assert measurements == {}
