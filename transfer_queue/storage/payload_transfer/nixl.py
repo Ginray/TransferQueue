@@ -186,7 +186,7 @@ class NixlPayloadTransfer(PayloadTransfer):
         )
         descriptor.validate()
         remote_may_be_prepared = False
-        send_attempted = False
+        send_future: Future[None] | None = None
         try:
             prepare = ZMQMessage.create(
                 request_type=ZMQRequestType.PUT_DATA_PREPARE,
@@ -207,7 +207,6 @@ class NixlPayloadTransfer(PayloadTransfer):
             token = ReceiveToken.from_dict(ready.body["receive_token"])
             endpoint = self._peer_endpoint(target_id)
             send_future = self.send(endpoint, token, descriptor, frames)
-            send_attempted = True
             await asyncio.wrap_future(send_future)
 
             commit = ZMQMessage.create(
@@ -220,7 +219,9 @@ class NixlPayloadTransfer(PayloadTransfer):
             response = ZMQMessage.deserialize(await control_socket.recv_multipart(copy=False))
             self._expect(response, ZMQRequestType.PUT_DATA_RESPONSE, target_id)
         except BaseException:
-            if remote_may_be_prepared and not send_attempted:
+            # Successful cancellation guarantees the queued WRITE never started.
+            # Running or completed sends must keep the remote receive reserved.
+            if remote_may_be_prepared and (send_future is None or send_future.cancel()):
                 await self._cancel(sender_id, target_id, ZMQRequestType.PUT_DATA_CANCEL, descriptor.transfer_id)
             raise
 
