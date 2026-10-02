@@ -266,7 +266,6 @@ class NixlRuntime:
                 self._receive_working_set_hwm_bytes = max(
                     self._receive_working_set_hwm_bytes, active_bytes
                 )
-                self._trim_idle_receive_buffers()
                 self._trace(
                     "receive_prepared",
                     transfer_id=descriptor.transfer_id,
@@ -275,7 +274,8 @@ class NixlRuntime:
                 )
             except Exception as exc:
                 if scratch is not None:
-                    self._return_receive_buffer(scratch)
+                    self._idle_receive_buffers.append(scratch)
+                    self._trim_idle_receive_buffers()
                 raise NixlError(f"failed to prepare NIXL receive buffer: {exc}") from exc
 
         return {
@@ -351,7 +351,7 @@ class NixlRuntime:
         with self._lock:
             scratch = self._receives.pop(transfer_id, None)
             if scratch is not None:
-                self._return_receive_buffer(scratch)
+                self._idle_receive_buffers.append(scratch)
                 self._trace("receive_cancelled", transfer_id=transfer_id, capacity=scratch.capacity)
 
     def quarantine_receive(self, transfer_id: str) -> None:
@@ -483,11 +483,6 @@ class NixlRuntime:
             capacity=scratch.capacity,
         )
         return scratch
-
-    def _return_receive_buffer(self, scratch: _RegisteredReceiveBuffer) -> None:
-        """Return a released receive MR to the bounded idle pool."""
-        self._idle_receive_buffers.append(scratch)
-        self._trim_idle_receive_buffers()
 
     def _evict_oldest_receive_buffer(self) -> None:
         oldest = self._idle_receive_buffers.pop(0)
@@ -671,7 +666,7 @@ class NixlRuntime:
                 return
             self._leased_receive_buffers.pop(key)
             scratch.lease_finalizer = None
-            self._return_receive_buffer(scratch)
+            self._idle_receive_buffers.append(scratch)
             self._trace("receive_lease_released", capacity=scratch.capacity)
 
     def _ensure_open(self) -> None:
