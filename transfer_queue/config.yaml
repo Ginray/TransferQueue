@@ -40,6 +40,8 @@ backend:
       # To use NIXL-UCX, replace the backend above with nixl-ucx.
       # Optional UCX environment variables; omit to use UCX defaults.
       # ucx_env_vars: {}
+      # Unused NIXL receive buffer cache per runtime; 0 disables caching.
+      # receive_buffer_cache_bytes: 268435456
       # See docs/nixl_ucx_payload.md for UCX transport and device configuration.
 
   # MooncakeStore: high-performance KV-based hierarchical storage
