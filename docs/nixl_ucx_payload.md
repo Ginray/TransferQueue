@@ -136,9 +136,11 @@ validation only confirm that the NIXL-UCX path is usable; to confirm RDMA, also 
 ### A NIXL Session Has Failed
 
 An uncertain WRITE retains its buffers until teardown; repeated GETs to that target are stopped.
-Recreate the affected payload-transfer runtime through the owning worker's error handling. A local
-decode error after confirmed completion does not fail the session. When metrics are enabled, the
-controller's `tq_storage_payload_*` metrics report cache, leased and quarantined bytes, queue wait
+Recreate the affected payload-transfer runtime through the owning worker's error handling.
+Failures confirmed before WRITE submission release the receiver without blocking that GET target.
+Cancelling a PUT waits for its running send to finish before safely releasing the unpublished receiver.
+A local decode error after confirmed completion does not fail the session. When metrics are enabled,
+the controller's `tq_storage_payload_*` metrics report cache, leased and quarantined bytes, queue wait
 and sender resources.
 
 ### RDMA Devices Are Ready, but NIXL-UCX Fails to Start

@@ -45,12 +45,15 @@ class NixlError(PayloadTransferError):
     """A NIXL runtime operation failed."""
 
 
+class NixlWriteNotStarted(NixlError):
+    """The failed send never exposed the remote receive buffer to a WRITE."""
+
+
 @dataclass
 class _RegisteredReceiveBuffer:
     buffer: bytearray
     registration: Any
     address: int
-    lease_finalizer: weakref.finalize | None = None
 
     @property
     def capacity(self) -> int:
@@ -209,14 +212,10 @@ class NixlRuntime:
 
     @property
     def diagnostics(self) -> dict[str, float | int]:
-        """Return the small runtime-only metric set from the design."""
+        """Snapshot payload resources and cumulative transfer costs."""
         with self._lock:
-            pending_receive_bytes = sum(
-                scratch.capacity for scratch in self._receives.values() if scratch is not None
-            )
-            leased_receive_bytes = sum(
-                scratch.capacity for scratch in self._leased_receive_buffers.values()
-            )
+            pending_receive_bytes = sum(scratch.capacity for scratch in self._receives.values() if scratch is not None)
+            leased_receive_bytes = sum(scratch.capacity for scratch in self._leased_receive_buffers.values())
             return {
                 "registration_seconds": self._registration_seconds,
                 "queue_wait_seconds": self._queue_wait_seconds,
@@ -254,17 +253,10 @@ class NixlRuntime:
             "idle": len(self._idle_receive_buffers),
             "leased": len(self._leased_receive_buffers),
             "quarantined": len(self._quarantined_receive_buffers),
-            "registered_bytes": self._registered_bytes,
-            "quarantined_bytes": self._quarantined_bytes,
             **self.diagnostics,
             **details,
         }
         logger.info("TQ_NIXL_LIFECYCLE %s", json.dumps(state, sort_keys=True))
-
-    def endpoint_metadata(self) -> bytes:
-        with self._lock:
-            self._ensure_open()
-            return self._agent.get_agent_metadata()
 
     def prepare_receive(self, descriptor: Any) -> dict[str, Any]:
         """Prepare frame-native remote descriptors and publish full metadata."""
@@ -388,7 +380,7 @@ class NixlRuntime:
                 owner = np.frombuffer(scratch.buffer, dtype=np.uint8, count=descriptor.payload_bytes)
                 frames = _frame_views(owner, descriptor.frame_sizes)
                 key = id(scratch)
-                scratch.lease_finalizer = weakref.finalize(owner, self._release_lease, key)
+                weakref.finalize(owner, self._release_lease, key)
                 self._leased_receive_buffers[key] = scratch
                 self._receives.pop(descriptor.transfer_id)
                 self._trace(
@@ -610,6 +602,7 @@ class NixlRuntime:
         handle = None
         error_message = None
         peer_state_uncertain = False
+        write_started = False
         try:
             with self._lock:
                 self._queue_wait_seconds += time.monotonic() - submitted_at
@@ -641,6 +634,7 @@ class NixlRuntime:
                 self._check_send_deadline(deadline)
                 started_transfer = time.monotonic()
                 peer_state_uncertain = True
+                write_started = True
                 status = self._agent.transfer(handle)
 
             while status == "PROC":
@@ -667,7 +661,8 @@ class NixlRuntime:
                         logger.warning("failed to release unposted NIXL transfer handle: %s", cleanup_exc)
                 if handle is None:
                     failed_sources = self._cleanup_sources(sources)
-                    self._retain_cleanup_failures(None, failed_sources)
+                    if failed_sources:
+                        self._retained_resources.append((None, failed_sources))
                     if peer_state_uncertain or failed_sources:
                         self._failed_peers.add(remote_name)
                 else:
@@ -680,7 +675,8 @@ class NixlRuntime:
 
         if error_message is not None:
             # A retained Future must not keep the native handle and agent alive.
-            raise NixlError(error_message)
+            error_type = NixlError if write_started else NixlWriteNotStarted
+            raise error_type(error_message)
 
         with self._lock:
             cleanup_failed = False
@@ -693,7 +689,8 @@ class NixlRuntime:
                 cleanup_failed = True
             if not cleanup_failed:
                 failed_sources = self._cleanup_sources(sources)
-                self._retain_cleanup_failures(None, failed_sources)
+                if failed_sources:
+                    self._retained_resources.append((None, failed_sources))
                 cleanup_failed = bool(failed_sources)
             if cleanup_failed:
                 self._failed_peers.add(remote_name)
@@ -730,17 +727,12 @@ class NixlRuntime:
                 failed.append(source)
         return failed
 
-    def _retain_cleanup_failures(self, handle: Any | None, sources: list[_FrameSource]) -> None:
-        if handle is not None or sources:
-            self._retained_resources.append((handle, sources))
-
     def _release_lease(self, key: int) -> None:
         with self._lock:
             scratch = self._leased_receive_buffers.get(key)
             if scratch is None or self._closed:
                 return
             self._leased_receive_buffers.pop(key)
-            scratch.lease_finalizer = None
             self._active_receive_count -= 1
             self._active_receive_bytes -= scratch.capacity
             self._cache_or_release_receive_buffer(scratch)

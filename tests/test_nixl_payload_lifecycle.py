@@ -34,6 +34,7 @@ from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import (
     DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_BYTES,
     NixlError,
     NixlRuntime,
+    NixlWriteNotStarted,
     _frame_regions,
     _FrameSource,
     _RegisteredReceiveBuffer,
@@ -601,7 +602,7 @@ def test_send_deadline_covers_queue_and_source_preparation(runtime, monkeypatch)
     finally:
         release.set()
     for future in (first, queued):
-        with pytest.raises(NixlError, match="including queue wait"):
+        with pytest.raises(NixlWriteNotStarted, match="including queue wait"):
             future.result(timeout=1)
     assert len(agent.register_calls) == len(agent.deregister_calls) == 1
     assert agent.transfer_calls == []
@@ -630,7 +631,7 @@ def test_expired_prepared_send_releases_unposted_handle_without_write(runtime, m
 
     monkeypatch.setattr(agent, "initialize_xfer", initialize_then_expire)
     token = _token("peer", b"metadata", descriptor)
-    with pytest.raises(NixlError, match="deadline expired"):
+    with pytest.raises(NixlWriteNotStarted, match="deadline expired"):
         instance.send({}, token, descriptor, (b"x",)).result(timeout=1)
     assert agent.transfer_calls == []
     assert ("peer" in instance._failed_peers) == cleanup_fails
@@ -659,7 +660,7 @@ def test_local_preparation_failure_only_fails_peer_if_cleanup_fails(runtime, mon
 
     monkeypatch.setattr(instance, "_acquire_frame_source", prepare)
     token = _token("peer", b"metadata", descriptor)
-    with pytest.raises(NixlError, match="source allocation failed"):
+    with pytest.raises(NixlWriteNotStarted, match="source allocation failed"):
         instance.send({}, token, descriptor, (b"x", b"y")).result(timeout=1)
     assert agent.transfer_calls == []
     assert ("peer" in instance._failed_peers) == cleanup_fails
@@ -672,7 +673,7 @@ def test_metadata_failure_still_fails_peer_before_handle_creation(runtime):
     instance, _ = runtime
     descriptor = _descriptor("bad-metadata", 1)
     token = _token("peer", b"unknown-metadata", descriptor)
-    with pytest.raises(NixlError):
+    with pytest.raises(NixlWriteNotStarted):
         instance.send({}, token, descriptor, (b"x",)).result(timeout=1)
     with pytest.raises(NixlError, match="has failed"):
         instance.send({}, token, descriptor, (b"x",))
@@ -701,6 +702,7 @@ def test_failed_future_does_not_retain_handle_or_sources(runtime):
     error = future.exception(timeout=1)
 
     assert isinstance(error, NixlError)
+    assert not isinstance(error, NixlWriteNotStarted)
     traceback = error.__traceback__
     while traceback is not None and traceback.tb_frame.f_code.co_name != "_send_scatter":
         traceback = traceback.tb_next
@@ -828,7 +830,8 @@ def test_get_commit_returns_deferred_response_and_maps_completion():
     assert response.future.result().request_type == ZMQRequestType.GET_DATA_RESPONSE
 
 
-def test_get_commit_maps_transfer_failure_to_normal_error_response():
+@pytest.mark.parametrize("failure", [NixlError("write failed"), NixlWriteNotStarted("not posted"), None])
+def test_get_commit_maps_transfer_failure_to_normal_error_response(failure):
     transfer = object.__new__(NixlPayloadTransfer)
     descriptor = _descriptor("failed-get", 1)
     transfer._pending_gets = {"failed-get": _PendingGet(descriptor, "manager", (bytearray(b"x"),))}
@@ -845,10 +848,17 @@ def test_get_commit_maps_transfer_failure_to_normal_error_response():
     )
 
     response = transfer._handle_get_commit(request, "storage")
-    send_future.set_exception(NixlError("write failed"))
+    if failure is None:
+        send_future.cancel()
+    else:
+        send_future.set_exception(failure)
 
     assert isinstance(response, DeferredResponse)
     assert response.future.result().request_type == ZMQRequestType.PUT_GET_ERROR
+    assert response.future.result().body["transfer_id"] == "failed-get"
+    assert response.future.result().body["write_not_started"] == (
+        failure is None or isinstance(failure, NixlWriteNotStarted)
+    )
 
 
 class _ProtocolSocket:
@@ -859,7 +869,10 @@ class _ProtocolSocket:
 
     async def send_multipart(self, frames: Any, **kwargs: Any) -> None:
         request = ZMQMessage.deserialize(frames)
-        if self.fail_commit and request.request_type in (ZMQRequestType.GET_DATA_COMMIT, ZMQRequestType.PUT_DATA_COMMIT):
+        if self.fail_commit and request.request_type in (
+            ZMQRequestType.GET_DATA_COMMIT,
+            ZMQRequestType.PUT_DATA_COMMIT,
+        ):
             raise RuntimeError("commit send failed")
         self.last_request = request
 
@@ -895,10 +908,105 @@ class _ProtocolSocket:
         return response.serialize()
 
 
-def test_put_does_not_cancel_after_send_is_attempted():
+class _LoopbackSocket:
+    def __init__(self, storage: NixlPayloadTransfer):
+        self.storage = storage
+
+    async def send_multipart(self, frames, **kwargs):
+        self.response = self.storage.handle_request(
+            ZMQMessage.deserialize(frames),
+            storage_id="storage",
+            load_data=lambda *args: {"value": [torch.arange(8)]},
+            store_data=lambda *args: pytest.fail("failed PUT must not publish data"),
+        )
+
+    async def recv_multipart(self, **kwargs):
+        response = self.response
+        if isinstance(response, DeferredResponse):
+            response = await asyncio.wrap_future(response.future)
+        return response.serialize()
+
+
+@pytest.mark.parametrize("operation", ["put", "get"])
+def test_prewrite_failure_releases_receiver_across_protocol_and_runtime(runtime, operation):
+    storage = NixlPayloadTransfer(receive_buffer_cache_bytes=0)
+    client = NixlPayloadTransfer(peer_infos={"storage": storage.bootstrap_info()}, receive_buffer_cache_bytes=0)
+    sender = client if operation == "put" else storage
+    sender._runtime._timeout_seconds = 0
+
+    async def exercise():
+        for _ in range(2):
+            kwargs = {"data": {"value": [1]}, "data_parser": None} if operation == "put" else {"fields": ["value"]}
+            with pytest.raises(RuntimeError, match="timed out"):
+                await getattr(client, operation)(
+                    control_socket=_LoopbackSocket(storage),
+                    sender_id="manager",
+                    target_id="storage",
+                    global_indexes=[1],
+                    **kwargs,
+                )
+            assert storage._pending_puts == storage._pending_gets == {}
+            for transfer in (storage, client):
+                assert transfer._runtime._receives == {}
+                assert transfer.diagnostics["registered_bytes"] == 0
+                assert transfer.diagnostics["quarantined_bytes"] == 0
+            assert client._failed_get_targets == set()
+        assert sender._runtime._agent.transfer_calls == []
+        assert sender._runtime._failed_peers == set()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        client.close()
+        storage.close()
+
+
+@pytest.mark.parametrize("failing_call", ["np.frombuffer", "_frame_views"])
+def test_put_commit_releases_receive_when_view_creation_fails(runtime, monkeypatch, failing_call):
+    storage = NixlPayloadTransfer(receive_buffer_cache_bytes=0)
+    descriptor = _descriptor("failed-view", 16)
+    prepare = ZMQMessage.create(
+        request_type=ZMQRequestType.PUT_DATA_PREPARE,
+        sender_id="manager",
+        body={"descriptor": descriptor.to_dict(), "global_indexes": [1]},
+    )
+    commit = ZMQMessage.create(
+        request_type=ZMQRequestType.PUT_DATA_COMMIT,
+        sender_id="other-manager",
+        body={"transfer_id": descriptor.transfer_id},
+    )
+
+    def fail_owner(*args, **kwargs):
+        raise MemoryError("view allocation failed")
+
+    try:
+        assert storage._handle_put_prepare(prepare, "storage").request_type == ZMQRequestType.PUT_DATA_READY
+        store_data = lambda *args: pytest.fail("failed PUT must not publish data")
+        assert storage._handle_put_commit(commit, "storage", store_data).request_type == ZMQRequestType.PUT_GET_ERROR
+        assert descriptor.transfer_id in storage._pending_puts
+        assert descriptor.transfer_id in storage._runtime._receives
+
+        monkeypatch.setattr(f"transfer_queue.storage.payload_transfer.nixl_ucx_runtime.{failing_call}", fail_owner)
+        commit = ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_DATA_COMMIT,
+            sender_id="manager",
+            body={"transfer_id": descriptor.transfer_id},
+        )
+        response = storage._handle_put_commit(commit, "storage", store_data)
+
+        assert response.request_type == ZMQRequestType.PUT_GET_ERROR
+        assert "view allocation failed" in response.body["message"]
+        assert storage._pending_puts == storage._runtime._receives == {}
+        assert storage.diagnostics["registered_bytes"] == 0
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("error_type", [NixlError, NixlWriteNotStarted])
+def test_put_only_cancels_failed_send_when_write_never_started(error_type):
     transfer = object.__new__(NixlPayloadTransfer)
     failed_send: Future[None] = Future()
-    failed_send.set_exception(NixlError("write failed"))
+    failed_send.set_exception(error_type("write failed"))
     transfer._peer_endpoint = lambda target_id: TransferEndpoint("nixl-ucx", {})
     transfer.send = lambda *args, **kwargs: failed_send
     cancellations: list[Any] = []
@@ -919,7 +1027,7 @@ def test_put_does_not_cancel_after_send_is_attempted():
             )
         )
 
-    assert cancellations == []
+    assert bool(cancellations) == (error_type is NixlWriteNotStarted)
 
 
 def test_put_cancels_prepared_receiver_before_send_is_attempted():
@@ -950,23 +1058,31 @@ def test_put_cancels_prepared_receiver_before_send_is_attempted():
     assert cancellations[0][2] == ZMQRequestType.PUT_DATA_CANCEL
 
 
-@pytest.mark.parametrize("send_state", ["done", "queued", "running"])
+@pytest.mark.parametrize("send_state", ["done", "queued", "running_done", "running_unposted", "running_failed"])
 def test_put_cancellation_at_write_completion_only_cancels_safe_receives(send_state):
     transfer = object.__new__(NixlPayloadTransfer)
     transfer._peer_endpoint = lambda target_id: TransferEndpoint("nixl-ucx", {})
     send_future = Future()
     if send_state == "done":
         send_future.set_result(None)
-    elif send_state == "running":
+    elif send_state.startswith("running"):
         send_future.set_running_or_notify_cancel()
     cancellations = []
     control_socket = _ProtocolSocket()
 
     def send(*args):
-        asyncio.get_running_loop().call_soon(asyncio.current_task().cancel)
+        loop = asyncio.get_running_loop()
+        loop.call_soon(asyncio.current_task().cancel)
+        if send_state == "running_done":
+            loop.call_later(0.01, send_future.set_result, None)
+        elif send_state == "running_unposted":
+            loop.call_later(0.01, send_future.set_exception, NixlWriteNotStarted("not posted"))
+        elif send_state == "running_failed":
+            loop.call_later(0.01, send_future.set_exception, NixlError("uncertain write"))
         return send_future
 
     async def cancel(*args):
+        assert send_future.done()
         cancellations.append(args)
 
     transfer.send = send
@@ -982,7 +1098,8 @@ def test_put_cancellation_at_write_completion_only_cancels_safe_receives(send_st
                 data_parser=None,
             )
         )
-    assert bool(cancellations) == (send_state != "running")
+    assert send_future.done()
+    assert bool(cancellations) == (send_state != "running_failed")
     if cancellations:
         assert cancellations[0][-1] is control_socket
     assert control_socket.last_request.request_type == ZMQRequestType.PUT_DATA_PREPARE
@@ -1016,9 +1133,7 @@ def test_put_does_not_cancel_after_commit_attempt():
 def test_cancel_drains_late_ready_and_matches_ack_on_original_socket(operation):
     transfer = object.__new__(NixlPayloadTransfer)
     replies = [
-        ZMQMessage.create(
-            request_type=ZMQRequestType[f"{operation}_DATA_READY"], sender_id="storage", body={}
-        ),
+        ZMQMessage.create(request_type=ZMQRequestType[f"{operation}_DATA_READY"], sender_id="storage", body={}),
         ZMQMessage.create(
             request_type=ZMQRequestType[f"{operation}_DATA_RESPONSE"],
             sender_id="storage",

@@ -32,6 +32,7 @@ from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import (
     DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_BYTES,
     NixlError,
     NixlRuntime,
+    NixlWriteNotStarted,
 )
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
@@ -144,8 +145,7 @@ class NixlPayloadTransfer(PayloadTransfer):
         receive_buffer_cache_bytes: int = DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_BYTES,
     ):
         self._peer_infos = dict(peer_infos or {})
-        self._control_peer_infos = dict(control_peer_infos or {})
-        if self._control_peer_infos and set(self._control_peer_infos) != set(self._peer_infos):
+        if control_peer_infos and set(control_peer_infos) != set(self._peer_infos):
             raise RuntimeError("SimpleStorage payload transfer endpoints are missing")
         try:
             self._runtime = NixlRuntime(ucx_env_vars, receive_buffer_cache_bytes=receive_buffer_cache_bytes)
@@ -165,13 +165,7 @@ class NixlPayloadTransfer(PayloadTransfer):
         return {"endpoint": self.endpoint().to_dict()}
 
     def endpoint(self) -> TransferEndpoint:
-        return TransferEndpoint(
-            transport=self.transport,
-            data={
-                "agent_name": self._runtime.agent_name,
-                "agent_metadata": self._runtime.endpoint_metadata(),
-            },
-        )
+        return TransferEndpoint(transport=self.transport, data={"agent_name": self._runtime.agent_name})
 
     async def put(
         self,
@@ -226,14 +220,21 @@ class NixlPayloadTransfer(PayloadTransfer):
             response = ZMQMessage.deserialize(await control_socket.recv_multipart(copy=False))
             self._expect(response, ZMQRequestType.PUT_DATA_RESPONSE, target_id)
         except BaseException:
-            # Before COMMIT, both a never-started WRITE and a successful DONE
-            # leave an unpublished receive that can be safely cancelled.
             if remote_may_be_prepared and not commit_attempted:
-                if (
-                    send_future is None
-                    or send_future.cancel()
-                    or (send_future.done() and send_future.exception() is None)
-                ):
+                safe_to_cancel = True
+                if send_future is not None and not send_future.cancel():
+                    safe_to_cancel = False
+                    # Keep the transaction socket alive until a running WRITE
+                    # finishes, even when the caller cancelled this PUT.
+                    try:
+                        await asyncio.wrap_future(send_future)
+                    except NixlWriteNotStarted:
+                        safe_to_cancel = True
+                    except Exception:
+                        pass
+                    else:
+                        safe_to_cancel = True
+                if safe_to_cancel:
                     await self._cancel(
                         sender_id, target_id, ZMQRequestType.PUT_DATA_CANCEL, descriptor.transfer_id, control_socket
                     )
@@ -289,6 +290,14 @@ class NixlPayloadTransfer(PayloadTransfer):
             commit_attempted = True
             await control_socket.send_multipart(commit.serialize(), copy=False)
             response = ZMQMessage.deserialize(await control_socket.recv_multipart(copy=False))
+            if (
+                response.request_type == ZMQRequestType.PUT_GET_ERROR
+                and response.sender_id == target_id
+                and response.body.get("transfer_id") == transfer_id
+                and response.body.get("write_not_started") is True
+            ):
+                self.cancel_receive(transfer_id)
+                receive_prepared = False
             self._expect(response, ZMQRequestType.GET_DATA_RESPONSE, target_id)
             if response.body.get("transfer_id") != transfer_id:
                 raise RuntimeError(f"GET completion identity changed by storage unit {target_id}")
@@ -364,7 +373,11 @@ class NixlPayloadTransfer(PayloadTransfer):
             if pending.sender_id != request.sender_id:
                 raise RuntimeError(f"PUT transfer {transfer_id} belongs to another sender")
             self._pending_puts.pop(transfer_id)
-            frames = self.receive(pending.descriptor).result()
+            try:
+                frames = self.receive(pending.descriptor).result()
+            except Exception:
+                self.cancel_receive(transfer_id)
+                raise
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{storage_id}] PUT commit"
             ):
@@ -426,6 +439,7 @@ class NixlPayloadTransfer(PayloadTransfer):
 
     def _handle_get_commit(self, request: ZMQMessage, storage_id: str) -> DeferredResponse | ZMQMessage:
         transfer_id = request.body["transfer_id"]
+        write_not_started = False
         try:
             pending = self._pending_gets.get(transfer_id)
             if pending is None:
@@ -433,9 +447,11 @@ class NixlPayloadTransfer(PayloadTransfer):
             if pending.sender_id != request.sender_id:
                 raise RuntimeError(f"GET transfer {transfer_id} belongs to another sender")
             self._pending_gets.pop(transfer_id)
+            write_not_started = True
             endpoint = TransferEndpoint.from_dict(request.body["receiver_endpoint"])
             token = ReceiveToken.from_dict(request.body["receive_token"])
             send_future = self.send(endpoint, token, pending.descriptor, pending.frames)
+            write_not_started = False
             response_future: Future[ZMQMessage] = Future()
 
             def complete_response(completed: Future[None]) -> None:
@@ -447,13 +463,21 @@ class NixlPayloadTransfer(PayloadTransfer):
                         body={"transfer_id": transfer_id},
                     )
                 except Exception as exc:
-                    response = self._error(storage_id, "GET commit", exc)
+                    response = self._error(
+                        storage_id,
+                        "GET commit",
+                        exc,
+                        transfer_id=transfer_id,
+                        write_not_started=completed.cancelled() or isinstance(exc, NixlWriteNotStarted),
+                    )
                 response_future.set_result(response)
 
             send_future.add_done_callback(complete_response)
             return DeferredResponse(response_future)
         except Exception as exc:
-            return self._error(storage_id, "GET commit", exc)
+            return self._error(
+                storage_id, "GET commit", exc, transfer_id=transfer_id, write_not_started=write_not_started
+            )
 
     def _handle_get_cancel(self, request: ZMQMessage, storage_id: str) -> ZMQMessage:
         transfer_id = request.body["transfer_id"]
@@ -555,11 +579,21 @@ class NixlPayloadTransfer(PayloadTransfer):
             )
 
     @staticmethod
-    def _error(storage_id: str, operation: str, error: Exception) -> ZMQMessage:
+    def _error(
+        storage_id: str,
+        operation: str,
+        error: Exception,
+        *,
+        transfer_id: str | None = None,
+        write_not_started: bool = False,
+    ) -> ZMQMessage:
+        body: dict[str, Any] = {"message": f"{operation} failed in storage unit {storage_id}: {error}"}
+        if transfer_id is not None:
+            body.update(transfer_id=transfer_id, write_not_started=write_not_started)
         return ZMQMessage.create(
             request_type=ZMQRequestType.PUT_GET_ERROR,
             sender_id=storage_id,
-            body={"message": f"{operation} failed in storage unit {storage_id}: {error}"},
+            body=body,
         )
 
     @staticmethod
