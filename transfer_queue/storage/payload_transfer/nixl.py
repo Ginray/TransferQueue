@@ -28,7 +28,11 @@ from uuid import uuid4
 import zmq.asyncio
 
 from transfer_queue.storage.payload_transfer.base import DeferredResponse, PayloadTransfer, PayloadTransferError
-from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import NixlError, NixlRuntime
+from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import (
+    DEFAULT_NIXL_MAX_IDLE_RECEIVE_BYTES,
+    NixlError,
+    NixlRuntime,
+)
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.serial_utils import decode, encode
@@ -142,13 +146,15 @@ class NixlPayloadTransfer(PayloadTransfer):
         ucx_env_vars: dict[str, object] | None = None,
         peer_infos: Mapping[str, object] | None = None,
         control_peer_infos: Mapping[str, ZMQServerInfo] | None = None,
+        *,
+        max_idle_receive_bytes: int = DEFAULT_NIXL_MAX_IDLE_RECEIVE_BYTES,
     ):
         self._peer_infos = dict(peer_infos or {})
         self._control_peer_infos = dict(control_peer_infos or {})
         if self._control_peer_infos and set(self._control_peer_infos) != set(self._peer_infos):
             raise RuntimeError("SimpleStorage payload transfer endpoints are missing")
         try:
-            self._runtime = NixlRuntime(ucx_env_vars)
+            self._runtime = NixlRuntime(ucx_env_vars, max_idle_receive_bytes=max_idle_receive_bytes)
         except NixlError:
             raise
         except Exception as exc:

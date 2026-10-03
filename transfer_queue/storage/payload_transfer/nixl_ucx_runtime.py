@@ -37,6 +37,7 @@ from transfer_queue.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_NIXL_TRANSFER_TIMEOUT_SECONDS = 180
+DEFAULT_NIXL_MAX_IDLE_RECEIVE_BYTES = 256 * 1024**2
 _POLL_INTERVAL_SECONDS = 0.0005
 
 
@@ -119,7 +120,18 @@ def _warn_if_tcp_fallback_possible() -> None:
 class NixlRuntime:
     """Own the NIXL agent, registered memory, and transfer completion."""
 
-    def __init__(self, ucx_env_vars: dict[str, object] | None = None):
+    def __init__(
+        self,
+        ucx_env_vars: dict[str, object] | None = None,
+        *,
+        max_idle_receive_bytes: int = DEFAULT_NIXL_MAX_IDLE_RECEIVE_BYTES,
+    ):
+        if (
+            isinstance(max_idle_receive_bytes, bool)
+            or not isinstance(max_idle_receive_bytes, int)
+            or max_idle_receive_bytes < 0
+        ):
+            raise NixlError("max_idle_receive_bytes must be a non-negative integer (bytes)")
         _configure_ucx_environment(ucx_env_vars)
         try:
             from nixl import nixl_agent, nixl_agent_config
@@ -163,6 +175,11 @@ class NixlRuntime:
         self._closed = False
         self._timeout_seconds = DEFAULT_NIXL_TRANSFER_TIMEOUT_SECONDS
         self._trace_enabled = os.environ.get("TQ_NIXL_LIFECYCLE_TRACE") == "1"
+        self._max_idle_receive_bytes = max_idle_receive_bytes
+        self._idle_receive_bytes = 0
+        self._active_receive_count = 0
+        self._active_receive_bytes = 0
+        self._receive_cleanup_failed = False
         self._receive_working_set_hwm_count = 0
         self._receive_working_set_hwm_bytes = 0
         self._registered_bytes = 0
@@ -187,7 +204,6 @@ class NixlRuntime:
     def diagnostics(self) -> dict[str, float | int]:
         """Return the small runtime-only metric set from the design."""
         with self._lock:
-            idle_receive_bytes = sum(scratch.capacity for scratch in self._idle_receive_buffers)
             pending_receive_bytes = sum(
                 scratch.capacity for scratch in self._receives.values() if scratch is not None
             )
@@ -200,7 +216,8 @@ class NixlRuntime:
                 "total_seconds": self._total_seconds,
                 "registered_bytes": self._registered_bytes,
                 "quarantined_bytes": self._quarantined_bytes,
-                "idle_receive_bytes": idle_receive_bytes,
+                "max_idle_receive_bytes": self._max_idle_receive_bytes,
+                "idle_receive_bytes": self._idle_receive_bytes,
                 "pending_receive_bytes": pending_receive_bytes,
                 "leased_receive_bytes": leased_receive_bytes,
                 "idle_receive_buffers": len(self._idle_receive_buffers),
@@ -256,27 +273,28 @@ class NixlRuntime:
                 else:
                     serialized = b""
                 metadata = self._agent.get_agent_metadata()
-                self._receives[descriptor.transfer_id] = scratch
-                if scratch is not None:
-                    self._receive_buffer_acquisitions += 1
-                active_count, active_bytes = self._receive_working_set()
-                self._receive_working_set_hwm_count = max(
-                    self._receive_working_set_hwm_count, active_count
-                )
-                self._receive_working_set_hwm_bytes = max(
-                    self._receive_working_set_hwm_bytes, active_bytes
-                )
-                self._trace(
-                    "receive_prepared",
-                    transfer_id=descriptor.transfer_id,
-                    payload_bytes=descriptor.payload_bytes,
-                    capacity=0 if scratch is None else scratch.capacity,
-                )
             except Exception as exc:
                 if scratch is not None:
-                    self._idle_receive_buffers.append(scratch)
-                    self._trim_idle_receive_buffers()
+                    self._cache_or_release_receive_buffer(scratch)
                 raise NixlError(f"failed to prepare NIXL receive buffer: {exc}") from exc
+
+            self._receives[descriptor.transfer_id] = scratch
+            if scratch is not None:
+                self._receive_buffer_acquisitions += 1
+                self._active_receive_count += 1
+                self._active_receive_bytes += scratch.capacity
+                self._receive_working_set_hwm_count = max(
+                    self._receive_working_set_hwm_count, self._active_receive_count
+                )
+                self._receive_working_set_hwm_bytes = max(
+                    self._receive_working_set_hwm_bytes, self._active_receive_bytes
+                )
+            self._trace(
+                "receive_prepared",
+                transfer_id=descriptor.transfer_id,
+                payload_bytes=descriptor.payload_bytes,
+                capacity=0 if scratch is None else scratch.capacity,
+            )
 
         return {
             "agent_name": self._agent_name,
@@ -324,22 +342,25 @@ class NixlRuntime:
         with self._lock:
             try:
                 self._ensure_open()
-                scratch = self._receives.pop(descriptor.transfer_id)
+                scratch = self._receives[descriptor.transfer_id]
                 if scratch is None:
+                    self._receives.pop(descriptor.transfer_id)
                     future.set_result(tuple(memoryview(b"") for _ in descriptor.frame_sizes))
                     return future
 
                 owner = np.frombuffer(scratch.buffer, dtype=np.uint8, count=descriptor.payload_bytes)
+                frames = _frame_views(owner, descriptor.frame_sizes)
                 key = id(scratch)
-                self._leased_receive_buffers[key] = scratch
                 scratch.lease_finalizer = weakref.finalize(owner, self._release_lease, key)
+                self._leased_receive_buffers[key] = scratch
+                self._receives.pop(descriptor.transfer_id)
                 self._trace(
                     "receive_leased",
                     transfer_id=descriptor.transfer_id,
                     payload_bytes=descriptor.payload_bytes,
                     capacity=scratch.capacity,
                 )
-                future.set_result(_frame_views(owner, descriptor.frame_sizes))
+                future.set_result(frames)
             except KeyError:
                 future.set_exception(NixlError(f"no prepared NIXL receive for {descriptor.transfer_id}"))
             except Exception as exc:
@@ -349,9 +370,13 @@ class NixlRuntime:
     def cancel_receive(self, transfer_id: str) -> None:
         """Release a receive that was never exposed to a possible WRITE."""
         with self._lock:
+            if self._closed:
+                return
             scratch = self._receives.pop(transfer_id, None)
             if scratch is not None:
-                self._idle_receive_buffers.append(scratch)
+                self._active_receive_count -= 1
+                self._active_receive_bytes -= scratch.capacity
+                self._cache_or_release_receive_buffer(scratch)
                 self._trace("receive_cancelled", transfer_id=transfer_id, capacity=scratch.capacity)
 
     def quarantine_receive(self, transfer_id: str) -> None:
@@ -359,6 +384,8 @@ class NixlRuntime:
         with self._lock:
             scratch = self._receives.pop(transfer_id, None)
             if scratch is not None:
+                self._active_receive_count -= 1
+                self._active_receive_bytes -= scratch.capacity
                 self._quarantined_receive_buffers.append(scratch)
                 self._quarantined_bytes += scratch.capacity
                 self._trace("receive_quarantined", transfer_id=transfer_id, capacity=scratch.capacity)
@@ -407,51 +434,25 @@ class NixlRuntime:
             self._remote_metadata.clear()
             self._registered_bytes = 0
             self._quarantined_bytes = 0
+            self._idle_receive_bytes = 0
+            self._active_receive_count = 0
+            self._active_receive_bytes = 0
         retained_sources.clear()
 
-    def _receive_working_set(self) -> tuple[int, int]:
-        """Return count and bytes for pending plus leased receive buffers."""
-        pending = [scratch for scratch in self._receives.values() if scratch is not None]
-        return (
-            len(pending) + len(self._leased_receive_buffers),
-            sum(scratch.capacity for scratch in pending)
-            + sum(scratch.capacity for scratch in self._leased_receive_buffers.values()),
-        )
-
-    def _trim_idle_receive_buffers(
-        self,
-        *,
-        reserve_count: int = 0,
-        reserve_bytes: int = 0,
-    ) -> None:
-        """Trim idle receive buffers to the observed working-set budget."""
-        active_count, active_bytes = self._receive_working_set()
-        count_limit = max(
-            self._receive_working_set_hwm_count, active_count + reserve_count
-        )
-        bytes_limit = max(
-            self._receive_working_set_hwm_bytes, active_bytes + reserve_bytes
-        )
-        idle_bytes = sum(scratch.capacity for scratch in self._idle_receive_buffers)
-        while self._idle_receive_buffers and (
-            active_count + len(self._idle_receive_buffers) + reserve_count > count_limit
-            or active_bytes + idle_bytes + reserve_bytes > bytes_limit
-        ):
-            evicted_capacity = self._idle_receive_buffers[0].capacity
-            self._evict_oldest_receive_buffer()
-            idle_bytes -= evicted_capacity
-
     def _acquire_receive_buffer(self, required_capacity: int) -> _RegisteredReceiveBuffer:
+        if self._receive_cleanup_failed:
+            raise NixlError("NIXL receive memory cleanup failed; recreate the runtime")
         candidates = (
             (scratch.capacity, index)
             for index, scratch in enumerate(self._idle_receive_buffers)
-            if scratch.capacity >= required_capacity
+            if required_capacity <= scratch.capacity <= 2 * required_capacity
         )
         best = min(candidates, default=None)
         if best is not None:
             _, index = best
             self._receive_buffer_reuses += 1
             scratch = self._idle_receive_buffers.pop(index)
+            self._idle_receive_bytes -= scratch.capacity
             self._trace(
                 "receive_buffer_reused",
                 required_capacity=required_capacity,
@@ -459,11 +460,15 @@ class NixlRuntime:
             )
             return scratch
 
-        # A miss replaces stale idle capacity before registering a new MR.
-        self._trim_idle_receive_buffers(
-            reserve_count=1,
-            reserve_bytes=required_capacity,
-        )
+        # Make room for a reusable new size without flushing the cache for an
+        # oversized transfer that cannot be cached when its lease ends.
+        if required_capacity <= self._max_idle_receive_bytes:
+            while self._idle_receive_bytes > self._max_idle_receive_bytes - required_capacity:
+                oldest = self._idle_receive_buffers.pop(0)
+                self._idle_receive_bytes -= oldest.capacity
+                self._deregister_receive_buffer(oldest)
+                if self._receive_cleanup_failed:
+                    raise NixlError("NIXL receive memory cleanup failed; recreate the runtime")
 
         buffer = bytearray(required_capacity)
         address = _buffer_address(buffer)
@@ -484,19 +489,27 @@ class NixlRuntime:
         )
         return scratch
 
-    def _evict_oldest_receive_buffer(self) -> None:
-        oldest = self._idle_receive_buffers.pop(0)
-        try:
-            self._agent.deregister_memory(oldest.registration, backends=["UCX"])
-        except Exception as exc:
-            logger.warning("failed to evict NIXL receive buffer: %s", exc)
-            self._quarantined_receive_buffers.append(oldest)
-            self._quarantined_bytes += oldest.capacity
-            self._trace("receive_buffer_quarantined", capacity=oldest.capacity)
+    def _cache_or_release_receive_buffer(self, scratch: _RegisteredReceiveBuffer) -> None:
+        """Return an unreferenced, safe receiver while the runtime lock is held."""
+        if scratch.capacity <= self._max_idle_receive_bytes - self._idle_receive_bytes:
+            self._idle_receive_buffers.append(scratch)
+            self._idle_receive_bytes += scratch.capacity
         else:
-            self._registered_bytes -= oldest.capacity
+            self._deregister_receive_buffer(scratch)
+
+    def _deregister_receive_buffer(self, scratch: _RegisteredReceiveBuffer) -> None:
+        try:
+            self._agent.deregister_memory(scratch.registration, backends=["UCX"])
+        except Exception as exc:
+            self._quarantined_receive_buffers.append(scratch)
+            self._quarantined_bytes += scratch.capacity
+            self._receive_cleanup_failed = True
+            logger.warning("failed to deregister NIXL receive buffer: %s", exc)
+            self._trace("receive_buffer_quarantined", capacity=scratch.capacity)
+        else:
+            self._registered_bytes -= scratch.capacity
             self._receive_buffer_evictions += 1
-            self._trace("receive_buffer_evicted", capacity=oldest.capacity)
+            self._trace("receive_buffer_evicted", capacity=scratch.capacity)
 
     def _register_frame_source(self, owner: bytearray | memoryview) -> _FrameSource:
         """Register one writable contiguous source while the runtime lock is held."""
@@ -666,7 +679,9 @@ class NixlRuntime:
                 return
             self._leased_receive_buffers.pop(key)
             scratch.lease_finalizer = None
-            self._idle_receive_buffers.append(scratch)
+            self._active_receive_count -= 1
+            self._active_receive_bytes -= scratch.capacity
+            self._cache_or_release_receive_buffer(scratch)
             self._trace("receive_lease_released", capacity=scratch.capacity)
 
     def _ensure_open(self) -> None:

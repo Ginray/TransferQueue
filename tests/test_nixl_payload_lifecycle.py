@@ -31,6 +31,7 @@ from transfer_queue.storage.payload_transfer.nixl import (
     _PendingGet,
 )
 from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import (
+    DEFAULT_NIXL_MAX_IDLE_RECEIVE_BYTES,
     NixlError,
     NixlRuntime,
     _frame_regions,
@@ -106,7 +107,7 @@ class _FakeAgent:
 
 
 @pytest.fixture
-def runtime(monkeypatch: pytest.MonkeyPatch):
+def runtime(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
     agents: list[_FakeAgent] = []
     module = types.ModuleType("nixl")
 
@@ -118,7 +119,9 @@ def runtime(monkeypatch: pytest.MonkeyPatch):
     module.nixl_agent = make_agent
     module.nixl_agent_config = lambda **kwargs: kwargs
     monkeypatch.setitem(sys.modules, "nixl", module)
-    instance = NixlRuntime()
+    instance = NixlRuntime(
+        max_idle_receive_bytes=getattr(request, "param", DEFAULT_NIXL_MAX_IDLE_RECEIVE_BYTES)
+    )
     yield instance, agents[0]
     instance.close()
 
@@ -166,8 +169,9 @@ def test_all_empty_frames_skip_registration_and_write(runtime):
     assert agent.transfer_calls == []
 
 
+@pytest.mark.parametrize("runtime", [0, DEFAULT_NIXL_MAX_IDLE_RECEIVE_BYTES], indirect=True)
 def test_receive_frames_decode_without_copy_and_lease_until_last_tensor(runtime):
-    instance, _ = runtime
+    instance, agent = runtime
     source = {"value": torch.arange(8, dtype=torch.int32)}
     encoded = tuple(encode(source))
     descriptor = _descriptor("receive", *(memoryview(frame).nbytes for frame in encoded))
@@ -188,11 +192,18 @@ def test_receive_frames_decode_without_copy_and_lease_until_last_tensor(runtime)
     gc.collect()
 
     assert instance._idle_receive_buffers == []
+    assert agent.deregister_calls == []
     assert torch.equal(detached, source["value"])
 
     del detached
     gc.collect()
-    assert instance._idle_receive_buffers == [scratch]
+    if instance.diagnostics["max_idle_receive_bytes"] == 0:
+        assert instance._idle_receive_buffers == []
+        assert agent.deregister_calls == [scratch.registration]
+        assert instance.diagnostics["registered_bytes"] == 0
+    else:
+        assert instance._idle_receive_buffers == [scratch]
+        assert instance.diagnostics["idle_receive_bytes"] == scratch.capacity
 
 
 def test_receive_pool_reuses_an_idle_buffer_that_fits(runtime):
@@ -216,7 +227,7 @@ def test_receive_pool_reuses_an_idle_buffer_that_fits(runtime):
 def test_receive_pool_best_fit_prefers_smallest_sufficient_idle_buffer(runtime):
     instance, agent = runtime
     smaller = _descriptor("smaller", 16)
-    larger = _descriptor("larger", 64)
+    larger = _descriptor("larger", 24)
 
     instance.prepare_receive(smaller)
     smaller_buffer = instance._receives[smaller.transfer_id]
@@ -225,7 +236,7 @@ def test_receive_pool_best_fit_prefers_smallest_sufficient_idle_buffer(runtime):
     instance.cancel_receive(smaller.transfer_id)
     instance.cancel_receive(larger.transfer_id)
 
-    request = _descriptor("request", 8)
+    request = _descriptor("request", 12)
     instance.prepare_receive(request)
 
     assert instance._receives[request.transfer_id] is smaller_buffer
@@ -251,8 +262,12 @@ def test_receive_pool_tracks_pending_and_leased_working_set(runtime):
     instance.cancel_receive(pending.transfer_id)
     del held_frames
     gc.collect()
+    assert instance.diagnostics["idle_receive_bytes"] == 40
+    assert instance.diagnostics["pending_receive_bytes"] == 0
+    assert instance.diagnostics["leased_receive_bytes"] == 0
 
 
+@pytest.mark.parametrize("runtime", [32], indirect=True)
 def test_receive_pool_evicts_oldest_idle_before_registering_on_miss(runtime):
     instance, agent = runtime
     leased = _descriptor("leased", 16)
@@ -293,6 +308,128 @@ def test_receive_pool_evicts_oldest_idle_before_registering_on_miss(runtime):
     del held_frames
 
 
+@pytest.mark.parametrize("runtime", [16], indirect=True)
+def test_receive_pool_releases_excess_on_return_without_another_prepare(runtime):
+    instance, agent = runtime
+    first = _descriptor("first", 16)
+    second = _descriptor("second", 16)
+    instance.prepare_receive(first)
+    instance.prepare_receive(second)
+    second_buffer = instance._receives[second.transfer_id]
+
+    instance.cancel_receive(first.transfer_id)
+    instance.cancel_receive(second.transfer_id)
+
+    assert instance.diagnostics["idle_receive_bytes"] == 16
+    assert instance.diagnostics["registered_bytes"] == 16
+    assert instance.diagnostics["pending_receive_buffers"] == 0
+    assert agent.deregister_calls == [second_buffer.registration]
+
+
+@pytest.mark.parametrize("runtime", [64], indirect=True)
+def test_receive_pool_does_not_lease_an_oversized_idle_buffer(runtime):
+    instance, agent = runtime
+    large = _descriptor("large", 64)
+    instance.prepare_receive(large)
+    large_buffer = instance._receives[large.transfer_id]
+    instance.cancel_receive(large.transfer_id)
+
+    small = _descriptor("small", 8)
+    instance.prepare_receive(small)
+
+    assert instance._receives[small.transfer_id].capacity == 8
+    assert instance._receives[small.transfer_id] is not large_buffer
+    assert agent.deregister_calls == [large_buffer.registration]
+    assert instance.diagnostics["receive_buffer_reuses"] == 0
+
+
+@pytest.mark.parametrize("runtime", [16], indirect=True)
+def test_receive_larger_than_cache_preserves_live_data_and_warm_idle_buffer(runtime):
+    instance, agent = runtime
+    warm = _descriptor("warm", 8)
+    instance.prepare_receive(warm)
+    warm_buffer = instance._receives[warm.transfer_id]
+    instance.cancel_receive(warm.transfer_id)
+
+    large = _descriptor("large", 32)
+    instance.prepare_receive(large)
+    large_buffer = instance._receives[large.transfer_id]
+    large_buffer.buffer[:] = b"x" * 32
+    frames = instance.receive(large).result()
+
+    assert bytes(frames[0]) == b"x" * 32
+    assert instance._idle_receive_buffers == [warm_buffer]
+    assert agent.deregister_calls == []
+
+    del frames
+    gc.collect()
+
+    assert agent.deregister_calls == [large_buffer.registration]
+    assert instance._idle_receive_buffers == [warm_buffer]
+    assert instance.diagnostics["idle_receive_bytes"] == 8
+    assert instance.diagnostics["registered_bytes"] == 8
+
+
+@pytest.mark.parametrize("runtime", [0], indirect=True)
+def test_receive_prepare_failure_releases_uncached_buffer(runtime, monkeypatch):
+    instance, agent = runtime
+
+    def fail_metadata():
+        raise RuntimeError("metadata failed")
+
+    monkeypatch.setattr(agent, "get_agent_metadata", fail_metadata)
+    with pytest.raises(NixlError, match="metadata failed"):
+        instance.prepare_receive(_descriptor("failed", 16))
+
+    assert instance._receives == {}
+    assert instance._idle_receive_buffers == []
+    assert len(agent.deregister_calls) == 1
+    assert instance.diagnostics["registered_bytes"] == 0
+
+
+@pytest.mark.parametrize("runtime", [0], indirect=True)
+@pytest.mark.parametrize("failing_call", ["np.frombuffer", "_frame_views"])
+def test_receive_exposure_failure_keeps_pending_buffer_owned(runtime, monkeypatch, failing_call):
+    instance, agent = runtime
+    descriptor = _descriptor("pending", 16)
+    instance.prepare_receive(descriptor)
+    scratch = instance._receives[descriptor.transfer_id]
+
+    def fail_owner(*args, **kwargs):
+        raise RuntimeError("view creation failed")
+
+    monkeypatch.setattr(f"transfer_queue.storage.payload_transfer.nixl_ucx_runtime.{failing_call}", fail_owner)
+    with pytest.raises(NixlError, match="view creation failed"):
+        instance.receive(descriptor).result()
+
+    assert instance._receives[descriptor.transfer_id] is scratch
+    assert instance._leased_receive_buffers == {}
+    assert agent.deregister_calls == []
+    instance.cancel_receive(descriptor.transfer_id)
+    assert agent.deregister_calls == [scratch.registration]
+    assert instance.diagnostics["registered_bytes"] == 0
+
+
+@pytest.mark.parametrize("runtime", [0, 16], indirect=True)
+def test_receive_cleanup_failure_retains_memory_and_stops_new_allocations(runtime):
+    instance, agent = runtime
+    descriptor = _descriptor("failed", 16)
+    instance.prepare_receive(descriptor)
+    scratch = instance._receives[descriptor.transfer_id]
+    agent.deregister_error = True
+
+    instance.cancel_receive(descriptor.transfer_id)
+
+    with pytest.raises(NixlError, match="receive memory cleanup failed"):
+        instance.prepare_receive(_descriptor("next", 4))
+    assert instance._quarantined_receive_buffers == [scratch]
+    assert instance.diagnostics["quarantined_bytes"] == 16
+    assert instance.diagnostics["registered_bytes"] == 16
+    assert instance.diagnostics["idle_receive_bytes"] == 0
+    assert len(agent.register_calls) == 1
+
+
+@pytest.mark.parametrize("runtime", [0], indirect=True)
 def test_sources_reuse_leased_mr_and_external_registration_is_transfer_scoped(runtime):
     instance, agent = runtime
     descriptor = _descriptor("lease", 8)

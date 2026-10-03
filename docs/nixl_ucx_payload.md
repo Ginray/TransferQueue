@@ -76,6 +76,37 @@ or GID, add the corresponding variables to `ucx_env_vars`.
 If NIXL initialization or a transfer fails, TQ reports the error directly and does not fall back to ZMQ.
 If the transport is not restricted, or if `UCX_TLS` includes `tcp`, UCX may use TCP.
 
+### Receive Buffer Cache
+
+`payload_transfer.max_idle_receive_bytes` optionally limits the total idle receive cache **per NIXL
+runtime**. It defaults to `268435456` bytes (256 MiB), grows on demand, and accepts a non-negative
+integer. Set it to `0` to disable idle caching. Place it alongside `backend` and `ucx_env_vars`:
+
+```yaml
+payload_transfer:
+  backend: nixl-ucx
+  max_idle_receive_bytes: 268435456
+  ucx_env_vars: {}
+```
+
+The runtime reuses the smallest idle buffer between one and two times the requested size. On a miss,
+it allocates the exact payload size and, for cacheable requests, evicts old idle buffers to make room
+for the new size. Requests larger than the cache budget still transfer normally and preserve the
+existing warm cache. A full cache does not reject or delay a transfer waiting for cache capacity.
+
+Receive buffers remain registered while their data is in use. When the last data reference ends, or
+a receive is safely cancelled, the buffer is cached only if it fits the remaining budget. Otherwise
+it is deregistered immediately. This can add cleanup latency and increase registration work when the
+budget is small. If deregistration fails, the runtime retains the buffer and rejects new non-empty
+receive preparations until it is recreated; this is a native cleanup failure, not cache backpressure.
+
+This budget covers idle buffers, not live rollout/replay data, quarantined memory, source staging,
+batch packing, or total process RSS. Add up the budgets of all runtimes on each node when choosing an
+override. For example, 16 runtimes with the default budget can retain up to 4 GiB of idle buffers.
+When memory permits, space for one or two typical receive batches is a useful tuning starting point;
+the budget need not cover the entire rollout window. Existing working-set high-water metrics remain
+diagnostic only and no longer determine cache capacity.
+
 ### Common UCX Configuration
 
 | Variable | Purpose | Reference value |
