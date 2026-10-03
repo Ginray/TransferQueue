@@ -78,34 +78,19 @@ If the transport is not restricted, or if `UCX_TLS` includes `tcp`, UCX may use 
 
 ### Receive Buffer Cache
 
-`payload_transfer.max_idle_receive_bytes` optionally limits the total idle receive cache **per NIXL
-runtime**. It defaults to `268435456` bytes (256 MiB), grows on demand, and accepts a non-negative
-integer. Set it to `0` to disable idle caching. Place it alongside `backend` and `ucx_env_vars`:
+`receive_buffer_cache_bytes` limits unused receive buffers cached **per NIXL runtime**.
+The default is 256 MiB; set `0` to disable caching. The cache grows on demand.
 
 ```yaml
 payload_transfer:
   backend: nixl-ucx
-  max_idle_receive_bytes: 268435456
-  ucx_env_vars: {}
+  receive_buffer_cache_bytes: 268435456  # bytes; optional
 ```
 
-The runtime reuses the smallest idle buffer between one and two times the requested size. On a miss,
-it allocates the exact payload size and, for cacheable requests, evicts old idle buffers to make room
-for the new size. Requests larger than the cache budget still transfer normally and preserve the
-existing warm cache. A full cache does not reject or delay a transfer waiting for cache capacity.
-
-Receive buffers remain registered while their data is in use. When the last data reference ends, or
-a receive is safely cancelled, the buffer is cached only if it fits the remaining budget. Otherwise
-it is deregistered immediately. This can add cleanup latency and increase registration work when the
-budget is small. If deregistration fails, the runtime retains the buffer and rejects new non-empty
-receive preparations until it is recreated; this is a native cleanup failure, not cache backpressure.
-
-This budget covers idle buffers, not live rollout/replay data, quarantined memory, source staging,
-batch packing, or total process RSS. Add up the budgets of all runtimes on each node when choosing an
-override. For example, 16 runtimes with the default budget can retain up to 4 GiB of idle buffers.
-When memory permits, space for one or two typical receive batches is a useful tuning starting point;
-the budget need not cover the entire rollout window. Existing working-set high-water metrics remain
-diagnostic only and no longer determine cache capacity.
+Transfers continue when the cache is full or a payload exceeds it. A smaller cache saves idle memory
+at the cost of more memory registrations. Account for all runtimes on a node when increasing it.
+Live rollout/replay data, in-flight transfers and fault-retained memory are outside this limit;
+it is not a limit on total process memory.
 
 ### Common UCX Configuration
 
@@ -147,6 +132,14 @@ validation only confirm that the NIXL-UCX path is usable; to confirm RDMA, also 
 `rc_*` indicates RDMA, while a TCP lane indicates that TCP is being used.
 
 ## Common Issues
+
+### A NIXL Session Has Failed
+
+An uncertain WRITE retains its buffers until teardown; repeated GETs to that target are stopped.
+Recreate the affected payload-transfer runtime through the owning worker's error handling. A local
+decode error after confirmed completion does not fail the session. When metrics are enabled, the
+controller's `tq_storage_payload_*` metrics report cache, leased and quarantined bytes, queue wait
+and sender resources.
 
 ### RDMA Devices Are Ready, but NIXL-UCX Fails to Start
 

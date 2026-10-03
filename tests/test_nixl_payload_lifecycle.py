@@ -31,7 +31,7 @@ from transfer_queue.storage.payload_transfer.nixl import (
     _PendingGet,
 )
 from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import (
-    DEFAULT_NIXL_MAX_IDLE_RECEIVE_BYTES,
+    DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_BYTES,
     NixlError,
     NixlRuntime,
     _frame_regions,
@@ -120,7 +120,7 @@ def runtime(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
     module.nixl_agent_config = lambda **kwargs: kwargs
     monkeypatch.setitem(sys.modules, "nixl", module)
     instance = NixlRuntime(
-        max_idle_receive_bytes=getattr(request, "param", DEFAULT_NIXL_MAX_IDLE_RECEIVE_BYTES)
+        receive_buffer_cache_bytes=getattr(request, "param", DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_BYTES)
     )
     yield instance, agents[0]
     instance.close()
@@ -169,7 +169,7 @@ def test_all_empty_frames_skip_registration_and_write(runtime):
     assert agent.transfer_calls == []
 
 
-@pytest.mark.parametrize("runtime", [0, DEFAULT_NIXL_MAX_IDLE_RECEIVE_BYTES], indirect=True)
+@pytest.mark.parametrize("runtime", [0, DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_BYTES], indirect=True)
 def test_receive_frames_decode_without_copy_and_lease_until_last_tensor(runtime):
     instance, agent = runtime
     source = {"value": torch.arange(8, dtype=torch.int32)}
@@ -197,7 +197,7 @@ def test_receive_frames_decode_without_copy_and_lease_until_last_tensor(runtime)
 
     del detached
     gc.collect()
-    if instance.diagnostics["max_idle_receive_bytes"] == 0:
+    if instance.diagnostics["receive_buffer_cache_bytes"] == 0:
         assert instance._idle_receive_buffers == []
         assert agent.deregister_calls == [scratch.registration]
         assert instance.diagnostics["registered_bytes"] == 0
@@ -508,6 +508,176 @@ def test_completed_write_cleanup_failure_keeps_success_and_fails_peer(runtime):
         instance.send({}, _token("peer", b"metadata", descriptor), descriptor, (bytearray(b"y"),))
 
 
+def test_sender_reuses_idle_executor_without_rebinding_outstanding_peer(runtime, monkeypatch):
+    instance, _ = runtime
+    descriptor = _descriptor("reuse-executor", 1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def send(remote_name, *args):
+        if remote_name == "peer-a":
+            started.set()
+            release.wait(timeout=2)
+
+    monkeypatch.setattr(instance, "_send_scatter", send)
+    first = instance.send({}, _token("peer-a", b"a", descriptor), descriptor, (b"x",))
+    try:
+        assert started.wait(timeout=1)
+        first_sender = instance._peer_senders["peer-a"]
+        queued = instance.send({}, _token("peer-a", b"a", descriptor), descriptor, (b"x",))
+        assert queued.cancel()
+        assert first_sender.outstanding == 1
+        other = instance.send({}, _token("peer-b", b"b", descriptor), descriptor, (b"x",))
+        assert instance._peer_senders["peer-b"] is not first_sender
+        other.result(timeout=1)
+    finally:
+        release.set()
+    first.result(timeout=1)
+    # A barrier also waits for the executor's Future completion callbacks.
+    first_sender.executor.submit(lambda: None).result(timeout=1)
+
+    instance.send({}, _token("next-epoch", b"c", descriptor), descriptor, (b"x",)).result(timeout=1)
+    assert instance._peer_senders["next-epoch"] is first_sender
+    assert "peer-a" not in instance._peer_senders
+    assert instance.diagnostics["sender_executors"] == 2
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled", "submit_error"])
+def test_sender_retires_immediate_completion_and_submit_failure(runtime, monkeypatch, outcome):
+    instance, agent = runtime
+    descriptor = _descriptor("retire", 1)
+    agent.metadata_names[b"metadata"] = "peer"
+    token = _token("peer", b"metadata", descriptor)
+    instance.send({}, token, descriptor, (b"x",)).result(timeout=1)
+    sender = instance._peer_senders["peer"]
+    sender.executor.submit(lambda: None).result(timeout=1)
+    completed = Future()
+    if outcome == "success":
+        completed.set_result(None)
+    elif outcome == "failure":
+        completed.set_exception(NixlError("write failed"))
+    else:
+        completed.cancel()
+
+    def submit(*args):
+        if outcome == "submit_error":
+            raise RuntimeError("submit failed")
+        return completed
+
+    monkeypatch.setattr(sender.executor, "submit", submit)
+    if outcome == "submit_error":
+        with pytest.raises(RuntimeError, match="submit failed"):
+            instance.send({}, token, descriptor, (b"x",))
+    else:
+        assert instance.send({}, token, descriptor, (b"x",)) is completed
+    assert instance.diagnostics["outstanding_sends"] == 0
+
+
+def test_send_deadline_covers_queue_and_source_preparation(runtime, monkeypatch):
+    instance, agent = runtime
+    descriptor = _descriptor("deadline", 1)
+    agent.metadata_names[b"metadata"] = "peer"
+    token = _token("peer", b"metadata", descriptor)
+    clock = [0.0]
+    monkeypatch.setattr(
+        "transfer_queue.storage.payload_transfer.nixl_ucx_runtime.time",
+        types.SimpleNamespace(monotonic=lambda: clock[0], sleep=time.sleep, time_ns=time.time_ns),
+    )
+    started = threading.Event()
+    release = threading.Event()
+    acquire = instance._acquire_frame_source
+
+    def prepare(frame):
+        started.set()
+        release.wait(timeout=2)
+        return acquire(frame)
+
+    monkeypatch.setattr(instance, "_acquire_frame_source", prepare)
+    first = instance.send({}, token, descriptor, (b"x",))
+    try:
+        assert started.wait(timeout=1)
+        queued = instance.send({}, token, descriptor, (b"y",))
+        clock[0] = instance._timeout_seconds + 1
+    finally:
+        release.set()
+    for future in (first, queued):
+        with pytest.raises(NixlError, match="including queue wait"):
+            future.result(timeout=1)
+    assert len(agent.register_calls) == len(agent.deregister_calls) == 1
+    assert agent.transfer_calls == []
+    assert instance._retained_resources == []
+    assert instance._failed_peers == set()
+    assert instance.diagnostics["queue_wait_seconds"] >= instance._timeout_seconds
+    assert instance.send({}, token, descriptor, (b"z",)).result(timeout=1) is None
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_expired_prepared_send_releases_unposted_handle_without_write(runtime, monkeypatch, cleanup_fails):
+    instance, agent = runtime
+    descriptor = _descriptor("pre-write-timeout", 1)
+    agent.metadata_names[b"metadata"] = "peer"
+    agent.release_error = cleanup_fails
+    initialize = agent.initialize_xfer
+    check_deadline = instance._check_send_deadline
+
+    def expire(deadline):
+        raise NixlError("send deadline expired")
+
+    def initialize_then_expire(*args, **kwargs):
+        handle = initialize(*args, **kwargs)
+        monkeypatch.setattr(instance, "_check_send_deadline", expire)
+        return handle
+
+    monkeypatch.setattr(agent, "initialize_xfer", initialize_then_expire)
+    token = _token("peer", b"metadata", descriptor)
+    with pytest.raises(NixlError, match="deadline expired"):
+        instance.send({}, token, descriptor, (b"x",)).result(timeout=1)
+    assert agent.transfer_calls == []
+    assert ("peer" in instance._failed_peers) == cleanup_fails
+    assert bool(instance._retained_resources) == cleanup_fails
+    if not cleanup_fails:
+        monkeypatch.setattr(instance, "_check_send_deadline", check_deadline)
+        monkeypatch.setattr(agent, "initialize_xfer", initialize)
+        assert instance.send({}, token, descriptor, (b"x",)).result(timeout=1) is None
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_local_preparation_failure_only_fails_peer_if_cleanup_fails(runtime, monkeypatch, cleanup_fails):
+    instance, agent = runtime
+    descriptor = _descriptor("prepare-failure", 1, 1)
+    agent.metadata_names[b"metadata"] = "peer"
+    agent.deregister_error = cleanup_fails
+    acquire = instance._acquire_frame_source
+    calls = 0
+
+    def prepare(frame):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise MemoryError("source allocation failed")
+        return acquire(frame)
+
+    monkeypatch.setattr(instance, "_acquire_frame_source", prepare)
+    token = _token("peer", b"metadata", descriptor)
+    with pytest.raises(NixlError, match="source allocation failed"):
+        instance.send({}, token, descriptor, (b"x", b"y")).result(timeout=1)
+    assert agent.transfer_calls == []
+    assert ("peer" in instance._failed_peers) == cleanup_fails
+    assert bool(instance._retained_resources) == cleanup_fails
+    if not cleanup_fails:
+        assert instance.send({}, token, descriptor, (b"x", b"y")).result(timeout=1) is None
+
+
+def test_metadata_failure_still_fails_peer_before_handle_creation(runtime):
+    instance, _ = runtime
+    descriptor = _descriptor("bad-metadata", 1)
+    token = _token("peer", b"unknown-metadata", descriptor)
+    with pytest.raises(NixlError):
+        instance.send({}, token, descriptor, (b"x",)).result(timeout=1)
+    with pytest.raises(NixlError, match="has failed"):
+        instance.send({}, token, descriptor, (b"x",))
+
+
 def test_failed_write_retains_resources_and_other_peer_still_works(runtime):
     instance, agent = runtime
     descriptor = _descriptor("failure", 1)
@@ -585,7 +755,7 @@ def test_close_tears_down_agent_before_retained_owners():
     instance._lock = threading.RLock()
     instance._closing = threading.Event()
     instance._closed = False
-    instance._peer_executors = {}
+    instance._peer_senders = {}
     instance._registered_sources = {}
     instance._receives = {}
     instance._idle_receive_buffers = []
@@ -689,7 +859,7 @@ class _ProtocolSocket:
 
     async def send_multipart(self, frames: Any, **kwargs: Any) -> None:
         request = ZMQMessage.deserialize(frames)
-        if self.fail_commit and request.request_type == ZMQRequestType.GET_DATA_COMMIT:
+        if self.fail_commit and request.request_type in (ZMQRequestType.GET_DATA_COMMIT, ZMQRequestType.PUT_DATA_COMMIT):
             raise RuntimeError("commit send failed")
         self.last_request = request
 
@@ -713,6 +883,12 @@ class _ProtocolSocket:
                 request_type=ZMQRequestType.GET_DATA_READY,
                 sender_id="storage",
                 body={"descriptor": descriptor.to_dict()},
+            )
+        elif request.request_type == ZMQRequestType.GET_DATA_COMMIT:
+            response = ZMQMessage.create(
+                request_type=ZMQRequestType.GET_DATA_RESPONSE,
+                sender_id=request.receiver_id,
+                body={"transfer_id": request.body["transfer_id"]},
             )
         else:
             raise AssertionError(f"unexpected receive after {request.request_type}")
@@ -774,6 +950,101 @@ def test_put_cancels_prepared_receiver_before_send_is_attempted():
     assert cancellations[0][2] == ZMQRequestType.PUT_DATA_CANCEL
 
 
+@pytest.mark.parametrize("send_state", ["done", "queued", "running"])
+def test_put_cancellation_at_write_completion_only_cancels_safe_receives(send_state):
+    transfer = object.__new__(NixlPayloadTransfer)
+    transfer._peer_endpoint = lambda target_id: TransferEndpoint("nixl-ucx", {})
+    send_future = Future()
+    if send_state == "done":
+        send_future.set_result(None)
+    elif send_state == "running":
+        send_future.set_running_or_notify_cancel()
+    cancellations = []
+    control_socket = _ProtocolSocket()
+
+    def send(*args):
+        asyncio.get_running_loop().call_soon(asyncio.current_task().cancel)
+        return send_future
+
+    async def cancel(*args):
+        cancellations.append(args)
+
+    transfer.send = send
+    transfer._cancel = cancel
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            transfer.put(
+                control_socket=control_socket,
+                sender_id="manager",
+                target_id="storage",
+                global_indexes=[1],
+                data={"value": [1]},
+                data_parser=None,
+            )
+        )
+    assert bool(cancellations) == (send_state != "running")
+    if cancellations:
+        assert cancellations[0][-1] is control_socket
+    assert control_socket.last_request.request_type == ZMQRequestType.PUT_DATA_PREPARE
+
+
+def test_put_does_not_cancel_after_commit_attempt():
+    transfer = object.__new__(NixlPayloadTransfer)
+    transfer._peer_endpoint = lambda target_id: TransferEndpoint("nixl-ucx", {})
+    completed = Future()
+    completed.set_result(None)
+    transfer.send = lambda *args: completed
+
+    async def cancel(*args):
+        pytest.fail("COMMIT may already have published the data")
+
+    transfer._cancel = cancel
+    with pytest.raises(RuntimeError, match="commit send failed"):
+        asyncio.run(
+            transfer.put(
+                control_socket=_ProtocolSocket(fail_commit=True),
+                sender_id="manager",
+                target_id="storage",
+                global_indexes=[1],
+                data={"value": [1]},
+                data_parser=None,
+            )
+        )
+
+
+@pytest.mark.parametrize("operation", ["PUT", "GET"])
+def test_cancel_drains_late_ready_and_matches_ack_on_original_socket(operation):
+    transfer = object.__new__(NixlPayloadTransfer)
+    replies = [
+        ZMQMessage.create(
+            request_type=ZMQRequestType[f"{operation}_DATA_READY"], sender_id="storage", body={}
+        ),
+        ZMQMessage.create(
+            request_type=ZMQRequestType[f"{operation}_DATA_RESPONSE"],
+            sender_id="storage",
+            body={"transfer_id": "another-transfer"},
+        ),
+        ZMQMessage.create(
+            request_type=ZMQRequestType[f"{operation}_DATA_RESPONSE"],
+            sender_id="storage",
+            body={"transfer_id": "cancelled-transfer"},
+        ),
+    ]
+
+    class CancelSocket(_ProtocolSocket):
+        async def recv_multipart(self, **kwargs):
+            return replies.pop(0).serialize()
+
+    control_socket = CancelSocket()
+    asyncio.run(
+        transfer._cancel(
+            "manager", "storage", ZMQRequestType[f"{operation}_DATA_CANCEL"], "cancelled-transfer", control_socket
+        )
+    )
+    assert replies == []
+    assert control_socket.last_request.request_type == ZMQRequestType[f"{operation}_DATA_CANCEL"]
+
+
 def test_put_cancels_when_send_fails_before_submission():
     transfer = object.__new__(NixlPayloadTransfer)
     transfer._peer_endpoint = lambda target_id: TransferEndpoint("nixl-ucx", {})
@@ -828,6 +1099,7 @@ def test_put_attempts_cancel_when_ready_is_lost():
 
 def test_get_cancels_remote_source_when_local_receive_prepare_fails():
     transfer = object.__new__(NixlPayloadTransfer)
+    transfer._failed_get_targets = set()
 
     def failed_prepare(descriptor: PayloadDescriptor) -> ReceiveToken:
         raise NixlError("registration failed")
@@ -855,6 +1127,7 @@ def test_get_cancels_remote_source_when_local_receive_prepare_fails():
 
 def test_get_commit_attempt_failure_quarantines_without_cancel():
     transfer = object.__new__(NixlPayloadTransfer)
+    transfer._failed_get_targets = set()
     transfer.prepare_receive = lambda descriptor: ReceiveToken({"agent_name": "manager"})
     quarantined: list[str] = []
     cancellations: list[Any] = []
@@ -878,6 +1151,53 @@ def test_get_commit_attempt_failure_quarantines_without_cancel():
 
     assert len(quarantined) == 1
     assert cancellations == []
+    assert transfer._failed_get_targets == {"storage"}
+
+    retry_socket = _ProtocolSocket()
+    with pytest.raises(NixlError, match="GET session.*has failed"):
+        asyncio.run(
+            transfer.get(
+                control_socket=retry_socket,
+                sender_id="manager",
+                target_id="storage",
+                global_indexes=[1],
+                fields=["value"],
+            )
+        )
+    assert retry_socket.last_request is None
+
+
+@pytest.mark.parametrize("failure_stage", ["receive", "decode"])
+def test_get_local_failure_after_ack_does_not_quarantine_or_fail_target(monkeypatch, failure_stage):
+    transfer = object.__new__(NixlPayloadTransfer)
+    transfer._failed_get_targets = {"unrelated-target"}
+    transfer.prepare_receive = lambda descriptor: ReceiveToken({"agent_name": "manager"})
+    cancellations = []
+    transfer.cancel_receive = cancellations.append
+    transfer.quarantine_receive = lambda transfer_id: pytest.fail("WRITE was already confirmed complete")
+    received = Future()
+    if failure_stage == "receive":
+        received.set_exception(NixlError("local receive failed"))
+    else:
+        received.set_result((memoryview(b"x"),))
+
+        def decode_failure(frames):
+            raise RuntimeError("local decode failed")
+
+        monkeypatch.setattr("transfer_queue.storage.payload_transfer.nixl.decode", decode_failure)
+    transfer.receive = lambda descriptor: received
+    with pytest.raises(RuntimeError, match=f"local {failure_stage} failed"):
+        asyncio.run(
+            transfer.get(
+                control_socket=_ProtocolSocket(),
+                sender_id="manager",
+                target_id="storage",
+                global_indexes=[1],
+                fields=["value"],
+            )
+        )
+    assert len(cancellations) == 1
+    assert transfer._failed_get_targets == {"unrelated-target"}
 
 
 class _CapturingSocket:

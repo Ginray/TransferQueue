@@ -555,6 +555,9 @@ class SimpleStorageUnit:
             "active_keys": self.storage_data.active_key_count,
             "process_rss_bytes": process_rss,
         }
+        payload_metrics = self.payload_transfer.diagnostics
+        if payload_metrics:
+            metrics["payload_transfer"] = payload_metrics
 
         # Include per-operation stats if Prometheus metrics are enabled
         if self._metrics is not None:

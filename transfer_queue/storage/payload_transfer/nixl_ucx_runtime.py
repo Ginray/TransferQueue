@@ -37,7 +37,7 @@ from transfer_queue.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_NIXL_TRANSFER_TIMEOUT_SECONDS = 180
-DEFAULT_NIXL_MAX_IDLE_RECEIVE_BYTES = 256 * 1024**2
+DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_BYTES = 256 * 1024**2
 _POLL_INTERVAL_SECONDS = 0.0005
 
 
@@ -63,6 +63,12 @@ class _FrameSource:
     registration: Any | None
     address: int
     size: int
+
+
+@dataclass
+class _PeerSender:
+    executor: ThreadPoolExecutor
+    outstanding: int = 0
 
 
 def _buffer_address(buffer: bytearray | memoryview) -> int:
@@ -124,14 +130,14 @@ class NixlRuntime:
         self,
         ucx_env_vars: dict[str, object] | None = None,
         *,
-        max_idle_receive_bytes: int = DEFAULT_NIXL_MAX_IDLE_RECEIVE_BYTES,
+        receive_buffer_cache_bytes: int = DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_BYTES,
     ):
         if (
-            isinstance(max_idle_receive_bytes, bool)
-            or not isinstance(max_idle_receive_bytes, int)
-            or max_idle_receive_bytes < 0
+            isinstance(receive_buffer_cache_bytes, bool)
+            or not isinstance(receive_buffer_cache_bytes, int)
+            or receive_buffer_cache_bytes < 0
         ):
-            raise NixlError("max_idle_receive_bytes must be a non-negative integer (bytes)")
+            raise NixlError("receive_buffer_cache_bytes must be a non-negative integer (bytes)")
         _configure_ucx_environment(ucx_env_vars)
         try:
             from nixl import nixl_agent, nixl_agent_config
@@ -169,13 +175,13 @@ class NixlRuntime:
         self._registered_sources: dict[int, _FrameSource] = {}
         self._remote_metadata: dict[str, bytes] = {}
         self._failed_peers: set[str] = set()
-        self._peer_executors: dict[str, ThreadPoolExecutor] = {}
+        self._peer_senders: dict[str, _PeerSender] = {}
         self._lock = threading.RLock()
         self._closing = threading.Event()
         self._closed = False
         self._timeout_seconds = DEFAULT_NIXL_TRANSFER_TIMEOUT_SECONDS
         self._trace_enabled = os.environ.get("TQ_NIXL_LIFECYCLE_TRACE") == "1"
-        self._max_idle_receive_bytes = max_idle_receive_bytes
+        self._receive_buffer_cache_bytes = receive_buffer_cache_bytes
         self._idle_receive_bytes = 0
         self._active_receive_count = 0
         self._active_receive_bytes = 0
@@ -189,6 +195,7 @@ class NixlRuntime:
         self._receive_buffer_reuses = 0
         self._receive_buffer_evictions = 0
         self._registration_seconds = 0.0
+        self._queue_wait_seconds = 0.0
         self._data_transfer_seconds = 0.0
         self._total_seconds = 0.0
 
@@ -212,11 +219,15 @@ class NixlRuntime:
             )
             return {
                 "registration_seconds": self._registration_seconds,
+                "queue_wait_seconds": self._queue_wait_seconds,
+                "outstanding_sends": sum(sender.outstanding for sender in self._peer_senders.values()),
+                "sender_executors": len(self._peer_senders),
+                "failed_send_peers": len(self._failed_peers),
                 "data_transfer_seconds": self._data_transfer_seconds,
                 "total_seconds": self._total_seconds,
                 "registered_bytes": self._registered_bytes,
                 "quarantined_bytes": self._quarantined_bytes,
-                "max_idle_receive_bytes": self._max_idle_receive_bytes,
+                "receive_buffer_cache_bytes": self._receive_buffer_cache_bytes,
                 "idle_receive_bytes": self._idle_receive_bytes,
                 "pending_receive_bytes": pending_receive_bytes,
                 "leased_receive_bytes": leased_receive_bytes,
@@ -311,6 +322,8 @@ class NixlRuntime:
         frames: tuple[bytes | bytearray | memoryview, ...],
     ) -> Future[None]:
         """Submit one transfer to the remote peer's single-worker executor."""
+        submitted_at = time.monotonic()
+        deadline = submitted_at + self._timeout_seconds
         descriptor.validate()
         if tuple(memoryview(frame).nbytes for frame in frames) != descriptor.frame_sizes:
             raise NixlError(f"frame lengths do not match descriptor for {descriptor.transfer_id}")
@@ -323,17 +336,41 @@ class NixlRuntime:
                 future: Future[None] = Future()
                 future.set_result(None)
                 return future
-            executor = self._peer_executors.get(remote_name)
-            if executor is None:
-                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tq-nixl-{remote_name}")
-                self._peer_executors[remote_name] = executor
-            return executor.submit(
-                self._send_scatter,
-                remote_name,
-                metadata,
-                tuple(frames),
-                token["frame_remote_descs"],
-            )
+            sender = self._peer_senders.get(remote_name)
+            if sender is None:
+                idle_peer = next(
+                    (peer for peer, binding in self._peer_senders.items() if binding.outstanding == 0), None
+                )
+                if idle_peer is not None:
+                    sender = self._peer_senders.pop(idle_peer)
+                else:
+                    sender = _PeerSender(ThreadPoolExecutor(max_workers=1, thread_name_prefix="tq-nixl-send"))
+                self._peer_senders[remote_name] = sender
+            sender.outstanding += 1
+            try:
+                future = sender.executor.submit(
+                    self._send_scatter,
+                    remote_name,
+                    metadata,
+                    tuple(frames),
+                    token["frame_remote_descs"],
+                    submitted_at,
+                    deadline,
+                )
+            except BaseException:
+                sender.outstanding -= 1
+                if sender.outstanding == 0:
+                    self._peer_senders.pop(remote_name)
+                    # A failed thread start can leave a work item queued.
+                    sender.executor.shutdown(wait=False, cancel_futures=True)
+                raise
+
+            def retire_send(completed: Future[None]) -> None:
+                with self._lock:
+                    sender.outstanding -= 1
+
+            future.add_done_callback(retire_send)
+            return future
 
     def receive(self, descriptor: Any) -> Future[tuple[memoryview, ...]]:
         """Return zero-copy frame views and lease the receive MR to their owner."""
@@ -397,8 +434,8 @@ class NixlRuntime:
                 return
             self._closed = True
             self._closing.set()
-            executors = list(self._peer_executors.values())
-            self._peer_executors.clear()
+            executors = [sender.executor for sender in self._peer_senders.values()]
+            self._peer_senders.clear()
 
         for executor in executors:
             executor.shutdown(wait=True, cancel_futures=True)
@@ -462,8 +499,8 @@ class NixlRuntime:
 
         # Make room for a reusable new size without flushing the cache for an
         # oversized transfer that cannot be cached when its lease ends.
-        if required_capacity <= self._max_idle_receive_bytes:
-            while self._idle_receive_bytes > self._max_idle_receive_bytes - required_capacity:
+        if required_capacity <= self._receive_buffer_cache_bytes:
+            while self._idle_receive_bytes > self._receive_buffer_cache_bytes - required_capacity:
                 oldest = self._idle_receive_buffers.pop(0)
                 self._idle_receive_bytes -= oldest.capacity
                 self._deregister_receive_buffer(oldest)
@@ -491,7 +528,7 @@ class NixlRuntime:
 
     def _cache_or_release_receive_buffer(self, scratch: _RegisteredReceiveBuffer) -> None:
         """Return an unreferenced, safe receiver while the runtime lock is held."""
-        if scratch.capacity <= self._max_idle_receive_bytes - self._idle_receive_bytes:
+        if scratch.capacity <= self._receive_buffer_cache_bytes - self._idle_receive_bytes:
             self._idle_receive_buffers.append(scratch)
             self._idle_receive_bytes += scratch.capacity
         else:
@@ -566,18 +603,22 @@ class NixlRuntime:
         metadata: bytes,
         frames: tuple[bytes | bytearray | memoryview, ...],
         serialized_remote_descs: bytes,
+        submitted_at: float,
+        deadline: float,
     ) -> None:
-        started_total = time.monotonic()
         sources: list[_FrameSource] = []
         handle = None
         error_message = None
+        peer_state_uncertain = False
         try:
             with self._lock:
+                self._queue_wait_seconds += time.monotonic() - submitted_at
                 self._ensure_open()
                 if remote_name in self._failed_peers:
                     raise NixlError(f"NIXL peer session {remote_name!r} has failed")
 
             for frame in frames:
+                self._check_send_deadline(deadline)
                 if memoryview(frame).nbytes:
                     sources.append(self._acquire_frame_source(frame))
 
@@ -585,21 +626,27 @@ class NixlRuntime:
                 self._ensure_open()
                 if remote_name in self._failed_peers:
                     raise NixlError(f"NIXL peer session {remote_name!r} has failed")
-                self._load_remote_metadata(remote_name, metadata)
                 local_descs = self._agent.get_xfer_descs(
                     [(source.address, source.size, 0) for source in sources], mem_type="DRAM"
                 )
                 remote_descs = self._agent.deserialize_descs(serialized_remote_descs)
+                self._check_send_deadline(deadline)
+                peer_state_uncertain = True
+                self._load_remote_metadata(remote_name, metadata)
+                peer_state_uncertain = False
+                self._check_send_deadline(deadline)
+                peer_state_uncertain = True
                 handle = self._agent.initialize_xfer("WRITE", local_descs, remote_descs, remote_name, backends=["UCX"])
+                peer_state_uncertain = False
+                self._check_send_deadline(deadline)
                 started_transfer = time.monotonic()
+                peer_state_uncertain = True
                 status = self._agent.transfer(handle)
 
-            deadline = started_transfer + self._timeout_seconds
             while status == "PROC":
                 if self._closing.is_set():
                     raise NixlError("NIXL runtime is closing")
-                if time.monotonic() >= deadline:
-                    raise NixlError(f"NIXL WRITE timed out after {self._timeout_seconds:g}s")
+                self._check_send_deadline(deadline)
                 with self._lock:
                     status = self._agent.check_xfer_state(handle)
                 if status == "PROC":
@@ -611,14 +658,25 @@ class NixlRuntime:
         except Exception as exc:
             error_message = f"NIXL H2H scatter WRITE failed: {exc}"
             with self._lock:
-                self._failed_peers.add(remote_name)
+                if handle is not None and not peer_state_uncertain:
+                    # The deadline expired after preparation but before WRITE.
+                    try:
+                        self._agent.release_xfer_handle(handle)
+                        handle = None
+                    except Exception as cleanup_exc:
+                        logger.warning("failed to release unposted NIXL transfer handle: %s", cleanup_exc)
                 if handle is None:
-                    self._retain_cleanup_failures(None, self._cleanup_sources(sources))
+                    failed_sources = self._cleanup_sources(sources)
+                    self._retain_cleanup_failures(None, failed_sources)
+                    if peer_state_uncertain or failed_sources:
+                        self._failed_peers.add(remote_name)
                 else:
+                    self._failed_peers.add(remote_name)
                     self._retained_resources.append((handle, sources))
-                self._total_seconds += time.monotonic() - started_total
+                self._total_seconds += time.monotonic() - submitted_at
             handle = None
             sources = []
+            failed_sources = []
 
         if error_message is not None:
             # A retained Future must not keep the native handle and agent alive.
@@ -639,7 +697,11 @@ class NixlRuntime:
                 cleanup_failed = bool(failed_sources)
             if cleanup_failed:
                 self._failed_peers.add(remote_name)
-            self._total_seconds += time.monotonic() - started_total
+            self._total_seconds += time.monotonic() - submitted_at
+
+    def _check_send_deadline(self, deadline: float) -> None:
+        if time.monotonic() >= deadline:
+            raise NixlError(f"NIXL send timed out after {self._timeout_seconds:g}s (including queue wait)")
 
     def _load_remote_metadata(self, remote_name: str, metadata: bytes) -> None:
         previous = self._remote_metadata.get(remote_name)

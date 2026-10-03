@@ -98,24 +98,24 @@ def test_nixl_factory_rejects_incomplete_peer_endpoints():
 def test_nixl_factory_passes_receive_cache_budget(monkeypatch, configured, expected):
     captured = {}
 
-    def make_runtime(ucx_env_vars, *, max_idle_receive_bytes):
-        captured["max_idle_receive_bytes"] = max_idle_receive_bytes
+    def make_runtime(ucx_env_vars, *, receive_buffer_cache_bytes):
+        captured["receive_buffer_cache_bytes"] = receive_buffer_cache_bytes
         return object()
 
     monkeypatch.setattr("transfer_queue.storage.payload_transfer.nixl.NixlRuntime", make_runtime)
     config = {"backend": "nixl-ucx"}
     if configured is not None:
-        config["max_idle_receive_bytes"] = configured
+        config["receive_buffer_cache_bytes"] = configured
 
     create_payload_transfer(config)
 
-    assert captured["max_idle_receive_bytes"] == expected
+    assert captured["receive_buffer_cache_bytes"] == expected
 
 
 @pytest.mark.parametrize("value", [-1, True, 1.5, "256MiB", None])
 def test_nixl_receive_cache_budget_rejects_invalid_values_before_agent_creation(value):
-    with pytest.raises(NixlError, match="max_idle_receive_bytes must be a non-negative integer"):
-        NixlRuntime(max_idle_receive_bytes=value)
+    with pytest.raises(NixlError, match="receive_buffer_cache_bytes must be a non-negative integer"):
+        NixlRuntime(receive_buffer_cache_bytes=value)
 
 
 def test_zmq_payload_transfer_handles_put_and_get_requests():

@@ -40,6 +40,11 @@ class DeferredResponse:
 class PayloadTransfer(ABC):
     """Complete SimpleStorage payload strategy, including its wire protocol."""
 
+    @property
+    def diagnostics(self) -> dict[str, float | int]:
+        """Return backend metrics for the storage metrics response."""
+        return {}
+
     @abstractmethod
     async def put(
         self,
